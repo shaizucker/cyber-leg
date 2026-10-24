@@ -1,0 +1,6 @@
+# Python-generated files
+__pycache__/
+*.py[cod]
+
+# Local scratch output and downloaded temporary tools
+/tmp/

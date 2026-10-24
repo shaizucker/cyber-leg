@@ -60,8 +60,8 @@ export function actuatorExtensions(anchors,pivot,pitch,roll,height){
   return 20+Math.hypot(...point.map((v,i)=>v-a.top[i]))-a.length;
  });
 }
-export function feasiblePose(anchors,pivot,pitch,roll,height){
- const valid=e=>e.every(x=>x>=0&&x<=50);
+export function feasiblePose(anchors,pivot,pitch,roll,height,limits=null){
+ const valid=e=>e.every((x,i)=>x>=(limits?.[i]?.[0]??0)&&x<=(limits?.[i]?.[1]??50));
  let e=actuatorExtensions(anchors,pivot,pitch,roll,height);
  if(valid(e))return {pitch,roll,height,extensions:e,limited:false};
  let lo=0,hi=1;

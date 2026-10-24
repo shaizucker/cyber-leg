@@ -1,0 +1,29 @@
+{
+  "operation": "enable knee position, overspeed and CAN-timeout protections",
+  "movement_command_sent": false,
+  "zero_command_sent": false,
+  "power_cycle_persistence_verified": false,
+  "physical_clockwise_limit_verified": false,
+  "before": {
+    "control_mode": 2,
+    "machine_offset_rad": 4.095345497131348,
+    "theta_min_rad": 0.0,
+    "theta_max_rad": 1.8300000429153442,
+    "can_timeout_ms": 1000,
+    "rotation_direction": 1,
+    "protection_mask": 4294967164
+  },
+  "save_flash_command_sent": true,
+  "after": {
+    "control_mode": 2,
+    "machine_offset_rad": 4.095345497131348,
+    "theta_min_rad": 0.0,
+    "theta_max_rad": 1.8300000429153442,
+    "can_timeout_ms": 1000,
+    "rotation_direction": 1,
+    "protection_mask": 4294967295
+  },
+  "readback_verified": true,
+  "protection_mask_hex": "0xFFFFFFFF",
+  "machine_zero_unchanged": true
+}

@@ -1,0 +1,47 @@
+{
+  "actuator_1": {
+    "node_id": 1,
+    "verified": "2026-10-22T23:02:41.5949582+03:00",
+    "note": "User identified this physically connected unit as the first actuator. ID read confirmed 1; no ID write needed."
+  },
+  "actuator_2": {
+    "note": "User-labelled second actuator confirmed at CAN ID 2 after power cycle. No response at previous ID 1.",
+    "power_cycle_verified": true,
+    "active_node_id": 2,
+    "node_id": 2,
+    "verified": "2026-10-22T23:06:09.3288851+03:00"
+  },
+  "actuator_3": {
+    "power_cycle_verified": true,
+    "active_node_id": 3,
+    "node_id": 3,
+    "note": "User-labelled third actuator confirmed at CAN ID 3 after power cycle. No response at previous ID 1.",
+    "verified": "2026-10-22T23:09:00.4510747+03:00"
+  },
+  "shared_bus_verified": {
+    "port": "COM7",
+    "nominal_bps": 1000000,
+    "data_bps": 5000000,
+    "nodes": [
+      {
+        "position_mm": 10.95,
+        "node_id": 1,
+        "status_word": "0x2002",
+        "fault_code": 0
+      },
+      {
+        "position_mm": 11.8,
+        "node_id": 2,
+        "status_word": "0x2002",
+        "fault_code": 0
+      },
+      {
+        "position_mm": 9.07,
+        "node_id": 3,
+        "status_word": "0x2002",
+        "fault_code": 0
+      }
+    ],
+    "verified": "2026-10-22T23:46:30.8058687+03:00"
+  }
+}

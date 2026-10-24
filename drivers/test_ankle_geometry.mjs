@@ -1,0 +1,17 @@
+import assert from 'node:assert/strict';
+import {readFile} from 'node:fs/promises';
+const source=await readFile(new URL('../CYBER_LEG_V01_Developer_Handoff/CYBER_LEG_V01/dist/motion.js',import.meta.url),'utf8');
+const {feasiblePose}=await import('data:text/javascript;base64,'+Buffer.from(source).toString('base64'));
+const anchors=[[-20,-20],[20,-20],[0,20]].map(([x,z])=>({top:[x,100,z],bottom:[x,0,z],length:100}));
+const limits=[[0,39],[0,39],[0,39]];
+const pose=(pitch,roll,height)=>feasiblePose(anchors,[0,0,0],pitch,roll,height,limits);
+assert.deepEqual(pose(0,0,0).extensions,[20,20,20]);
+assert.deepEqual(pose(0,0,10).extensions,[30,30,30]);
+assert.deepEqual(pose(0,0,-10).extensions,[10,10,10]);
+const tilt=pose(10,8,0), combined=pose(10,8,8);
+assert.ok(Math.max(...tilt.extensions)-Math.min(...tilt.extensions)>1);
+assert.ok(combined.extensions.every((x,i)=>x>tilt.extensions[i]));
+const limited=pose(45,30,15);
+assert.ok(limited.limited);
+assert.ok(limited.extensions.every(x=>x>=0&&x<=39));
+console.log('Ankle geometry: neutral, common height, combined tilt/height and drive limits passed');

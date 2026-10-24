@@ -1,4 +1,4 @@
-"""Local simulator-to-knee bridge. Run with --help for options."""
+"""Local simulator-to-knee-and-ankle bridge. Run with --help for options."""
 import argparse
 import json
 import math
@@ -12,24 +12,32 @@ from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
-from knee_control_cli import min_jerk, MIN_MOVE_TIME, MAX_TRAJ_VEL
-from knee_trajectory import KneeTrajectory
+from knee_safety import read_configuration, validate_configuration
 
-DT = 0.01
+DT = 0.02
 STALE_SECONDS = 0.5
-MAX_SPEED = 2.0
-SIM_MAX = math.radians(70)
-SERVO_BASELINE = dict(kp_pos=40.0, kd_pos=5.0, kp_vel=50.0, kd_vel=0.0, ki_vel=0.005)
-SERVO_DEFAULTS = dict(kp_pos=40.0, kd_pos=10.0, kp_vel=50.0, kd_vel=0.0, ki_vel=0.001)
-SERVO_MAX = dict(kp_pos=250.0, kd_pos=50.0, kp_vel=250.0, kd_vel=50.0, ki_vel=0.05)
+MAX_VELOCITY = 10.0  # Configured P-T-M velocity encoding range, rad/s.
+SIM_MAX_DEG = 105.0
+# Match gemini-code-gui.py and the current MParameter Studio configuration.
+THETA_MIN, THETA_MAX = 0.0, 1.83
+SIM_MAX = THETA_MAX  # 105 degrees saturates at 1.83 rad, as in the working GUI.
+PTM_DEFAULTS = dict(kp_pos=20.0, kd_pos=4.0)
+PTM_MAX = dict(kp_pos=250.0, kd_pos=50.0)
+
+
+def validate_mapping(sign, offset):
+    if sign not in (-1, 1) or not math.isfinite(offset):
+        raise ValueError('Invalid motor direction or offset')
+    if any(not THETA_MIN <= p <= THETA_MAX for p in (offset, offset + sign * SIM_MAX)):
+        raise ValueError('Mapped knee range must fit within the configured motor range 0..1.83 rad')
 
 
 def validate_gains(gains):
-    if set(gains) != set(SERVO_DEFAULTS):
-        raise ValueError('Provide all five servo gains')
+    if set(gains) != set(PTM_DEFAULTS):
+        raise ValueError('Provide both P-T-M position gains')
     for name, value in gains.items():
-        if isinstance(value, bool) or not isinstance(value, (float, int)) or not math.isfinite(value) or not 0 <= value <= SERVO_MAX[name]:
-            raise ValueError(f'{name} must be finite and between 0 and {SERVO_MAX[name]}')
+        if isinstance(value, bool) or not isinstance(value, (float, int)) or not math.isfinite(value) or not 0 <= value <= PTM_MAX[name]:
+            raise ValueError(f'{name} must be finite and between 0 and {PTM_MAX[name]}')
     return dict(gains)
 
 
@@ -67,59 +75,71 @@ class CanTrace:
 
 
 class KneeBridge:
-    def __init__(self, motor_factory, sign=1, offset=0, log=None, gains=None):
-        self.gains = validate_gains(SERVO_DEFAULTS if gains is None else gains)
+    def __init__(self, motor_factory, sign=1, offset=0, log=None, gains=None, ankle=None):
+        validate_mapping(sign, offset)
+        self.gains = validate_gains(PTM_DEFAULTS if gains is None else gains)
         self.motor_factory, self.sign, self.offset = motor_factory, sign, offset
         self.log = log or (lambda message: None)
         self.lock = threading.RLock()
+        self.ankle = ankle
         self.motor = None
         self.armed = False
         self.goal = None
         self.running = False
         self.mode = 'manual'
-        self._traj = None
-        self.planner = None
+        self.velocity = 0.0
         self._last_diagnostic = 0.0
         self.setpoint = None
         self.feedback = None
         self.samples = deque(maxlen=6000)
         self.last_update = 0.0
         self.error = None
+        self.configuration = None
+        self.zero_verification = None
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
 
-    def update(self, angle_deg, running, mode='manual'):
-        if isinstance(angle_deg, bool) or not isinstance(angle_deg, (int, float)) or not math.isfinite(angle_deg) or not 0 <= angle_deg <= 70:
-            raise ValueError("Knee angle must be between 0 and 70 degrees")
+    def update(self, angle_deg, running, mode='manual', velocity_deg_s=0.0, extensions_mm=None):
+        if isinstance(angle_deg, bool) or not isinstance(angle_deg, (int, float)) or not math.isfinite(angle_deg) or not 0 <= angle_deg <= SIM_MAX_DEG:
+            raise ValueError("Knee angle must be between 0 and 105 degrees")
         if not isinstance(running, bool):
             raise ValueError("Running state must be a boolean")
         if mode not in ('manual', 'auto'):
             raise ValueError('Unknown simulator mode')
+        if isinstance(velocity_deg_s, bool) or not isinstance(velocity_deg_s, (int, float)) or not math.isfinite(velocity_deg_s):
+            raise ValueError('Knee velocity must be finite degrees per second')
         with self.lock:
-            old_goal, old_mode = self.goal, self.mode
+            if self.ankle:
+                self.ankle.update(extensions_mm, running)
             self.mode = mode
             self.running = running
-            self.goal = (self.sign * math.radians(angle_deg) + self.offset
+            self.goal = (self.sign * min(math.radians(angle_deg), SIM_MAX) + self.offset
                          if running or not self.armed else self.setpoint)
             self.last_update = time.monotonic()
-            if not running:
-                self._traj = None
-                if self.planner and self.setpoint is not None:
-                    self.planner.reset(self.setpoint)
-            elif self.armed and (self.goal != old_goal or mode != old_mode):
-                self._plan_manual_move()
-
-    def _plan_manual_move(self):
-        # Retain position and velocity history when targets change in either mode.
-        self._traj = None
-        if self.planner is None:
-            self.planner = KneeTrajectory(self.setpoint, max_speed=MAX_SPEED)
+            # Browser targets already contain the simulator's motion profile.
+            # Sending them directly avoids adding a second, slower trajectory.
+            velocity = self.sign * math.radians(velocity_deg_s) if running and mode == 'auto' else 0.0
+            if ((angle_deg >= math.degrees(THETA_MAX) and velocity_deg_s > 0) or
+                    (angle_deg == 0 and velocity_deg_s < 0)):
+                velocity = 0.0
+            self.velocity = max(-MAX_VELOCITY, min(MAX_VELOCITY, velocity))
 
     def _advance_setpoint(self, now, elapsed):
-        if self.planner is None:
-            self._plan_manual_move()
-        self.setpoint = self.planner.advance(self.goal, min(max(elapsed, 0.0001), DT * 2))
+        if self.ankle and not self.ankle.status()['armed']:
+            return  # Hold measured knee position until the ankle is ready too.
+        self.setpoint = self.goal
+
+    def _command_velocity(self, now):
+        # A delayed browser update must not keep requesting motion indefinitely.
+        if self.ankle and not self.ankle.status()['armed']:
+            return 0.0
+        return self.velocity if self.running and now - self.last_update <= DT * 2 else 0.0
+
+    def _verify_motor_configuration(self):
+        self.configuration = read_configuration(self.motor)
+        validate_configuration(self.configuration, THETA_MIN, THETA_MAX)
+        return self.configuration
 
     def arm(self):
         with self.lock:
@@ -127,10 +147,18 @@ class KneeBridge:
                 return
             if self.goal is None or time.monotonic() - self.last_update > STALE_SECONDS:
                 raise ValueError("Simulator updates are not current")
-            if not -12.5 <= self.goal <= 12.5:
+            if not THETA_MIN <= self.goal <= THETA_MAX:
                 raise ValueError("Mapped target is outside the motor range")
+            if self.ankle:
+                self.ankle.check_ready()
             try:
                 self.motor = self.motor_factory()
+                config = self._verify_motor_configuration()
+                if self.zero_verification is not None:
+                    if not self.zero_verification.get('command_confirmed'):
+                        raise RuntimeError('Previous knee zero verification failed; verify zero before arming')
+                    if abs(config['machine_offset_rad'] - self.zero_verification['machine_offset_after_rad']) > 1e-6:
+                        raise RuntimeError('Knee machine zero changed since verification; verify the reference again')
                 t = self.motor.enter_rest_mode()
                 if not t or t['fault'] != 0 or t['status'] != 0:
                     raise RuntimeError("Rest state failed or a fault is present")
@@ -139,16 +167,18 @@ class KneeBridge:
                     raise RuntimeError(f"Measured position {math.degrees(t['position_rad']):.2f} degrees is outside {math.degrees(lo):.1f} to {math.degrees(hi):.1f} degrees; disarm and zero at the reference pose")
                 self.feedback = t
                 self.setpoint = t['position_rad']
-                self.planner = KneeTrajectory(self.setpoint, max_speed=MAX_SPEED)
                 if not self.running:
                     self.goal = self.setpoint
+                time.sleep(0.05)  # Match the working GUI's Rest-to-Motor delay.
+                if time.monotonic() - self.last_update > STALE_SECONDS:
+                    raise RuntimeError('Simulator updates became stale during knee configuration checks')
                 t = self.motor.enter_motor_mode()
-                if not t or t['status'] != 1 or t['fault'] != 0:
-                    raise RuntimeError("Motor did not enter servo mode without a fault")
+                if not t or t['status'] != 2 or t['fault'] != 0:
+                    raise RuntimeError("Motor did not enter P-T-M mode (status 2) without a fault; check MParameter Studio control mode")
                 self.feedback = t
                 self.armed = True
-                if self.running:
-                    self._plan_manual_move()
+                if self.ankle:
+                    self.ankle.arm()
                 self.error = None
             except Exception as exc:
                 self.error = str(exc)
@@ -158,7 +188,9 @@ class KneeBridge:
 
     def _disarm_locked(self):
         self.armed = False
-        self._traj = None
+        if self.ankle:
+            self.ankle.disarm()
+        self.velocity = 0.0
         if self.motor:
             try:
                 self.motor.close()
@@ -174,23 +206,46 @@ class KneeBridge:
                 raise ValueError('Stop the simulator before zeroing')
             if self.offset != 0:
                 raise ValueError('Hardware zero requires --offset-deg 0')
+            self.zero_verification = dict(command_confirmed=False, physical_reference_verified=False,
+                                          power_cycle_persistence_verified=False)
             try:
                 self.motor = self.motor_factory()
+                before = self._verify_motor_configuration()
                 t = self.motor.enter_rest_mode()
-                if not t or t['status'] != 0 or t['fault'] != 0:
-                    raise RuntimeError('Cannot zero: motor did not confirm fault-free Rest')
-                self.motor.set_zero_position()
-                # The zero-command reply can contain the previous position.
-                time.sleep(0.05)
-                t = self.motor.enter_rest_mode()
-                self.feedback = t
-                if not t or t['status'] != 0 or t['fault'] != 0 or abs(t['position_rad']) > math.radians(0.5):
-                    raise RuntimeError(f'Zero verification failed: {t}')
+                if (not t or t['status'] != 0 or t['fault'] != 0 or
+                        not math.isfinite(t['position_rad']) or not math.isfinite(t['velocity_rad_s']) or
+                        abs(t['velocity_rad_s']) > 0.05):
+                    raise RuntimeError('Cannot zero: motor must confirm fault-free stationary Rest')
+                previous_position = t['position_rad']
+                acknowledgement = self.motor.set_zero_position()
+                if not acknowledgement or acknowledgement['status'] != 0 or acknowledgement['fault'] != 0:
+                    raise RuntimeError(f'Zero command was not acknowledged in fault-free Rest: {acknowledgement}')
+                # Never trust the zero reply alone; it can contain old feedback.
+                time.sleep(0.15)
+                for _ in range(3):
+                    t = self.motor.enter_rest_mode()
+                    self.feedback = t
+                    if (not t or t['status'] != 0 or t['fault'] != 0 or
+                            not math.isfinite(t['position_rad']) or
+                            abs(t['position_rad']) > math.radians(0.1) or
+                            not math.isfinite(t['velocity_rad_s']) or abs(t['velocity_rad_s']) > 0.05):
+                        raise RuntimeError(f'Zero verification failed: {t}')
+                    time.sleep(0.05)
+                after = self._verify_motor_configuration()
+                if (abs(previous_position) > math.radians(0.1) and
+                        abs(after['machine_offset_rad'] - before['machine_offset_rad']) <= 1e-6):
+                    raise RuntimeError('Zero feedback is near zero but Machine Angle Offset did not change')
                 self.setpoint = self.goal = t['position_rad']
+                self.zero_verification.update(command_confirmed=True,
+                    machine_offset_before_rad=before['machine_offset_rad'],
+                    machine_offset_after_rad=after['machine_offset_rad'],
+                    position_after_rad=t['position_rad'])
                 self.error = None
-                self.log(f"Zero verified: {math.degrees(t['position_rad']):.3f} degrees; motor remains disarmed")
+                self.log(f"Zero command/readback confirmed: {math.degrees(t['position_rad']):.3f} degrees; "
+                         'physical reference and power-cycle persistence still require verification; remains disarmed')
             except Exception as exc:
                 self.error = str(exc)
+                self.zero_verification['error'] = str(exc)
                 self.log(f'Zero failed: {exc}')
                 raise
             finally:
@@ -207,7 +262,11 @@ class KneeBridge:
     def status(self):
         with self.lock:
             return {"armed": self.armed, "error": self.error, "feedback": self.feedback,
+                    "motor_configuration": self.configuration, "zero_verification": self.zero_verification,
                     "setpoint_rad": self.setpoint, "goal_rad": self.goal,
+                    "command_velocity_rad_s": self._command_velocity(time.monotonic()),
+                    "control_mode": "P-T-M", "max_angle_deg": SIM_MAX_DEG,
+                    "ankle": self.ankle.status() if self.ankle else {"enabled": False},
                     "sign": self.sign, "offset_rad": self.offset, "gains": self.gains.copy()}
 
     def _loop(self):
@@ -218,21 +277,26 @@ class KneeBridge:
             with self.lock:
                 if self.armed:
                     try:
+                        if self.ankle and self.ankle.status()['error']:
+                            raise RuntimeError(self.ankle.status()['error'])
                         if now - self.last_update > STALE_SECONDS:
                             raise RuntimeError("Simulator connection lost; motor disarmed")
-                        # Limit elapsed time as well as the rate after scheduling pauses.
                         self._advance_setpoint(now, now - last_t)
-                        t = self.motor.send_servo_command(
-                            self.setpoint, vel_limit_rad_s=2.5, **self.gains, timeout=0.01)
+                        if not math.isfinite(self.setpoint) or not THETA_MIN <= self.setpoint <= THETA_MAX:
+                            raise RuntimeError('Knee command outside the verified position range')
+                        t = self.motor.send_ptm_command(
+                            self.setpoint, vel_rad_s=self._command_velocity(now), kp=self.gains['kp_pos'],
+                            kd=self.gains['kd_pos'], torque_ff_nm=0.0, timeout=0.01)
                         if not t:
                             raise RuntimeError("Motor feedback timed out")
                         self.feedback = t
                         self.samples.append(dict(t=time.monotonic(), goal_rad=self.goal,
-                                                 command_rad=self.setpoint, **t))
+                                                 command_rad=self.setpoint,
+                                                 command_velocity_rad_s=self._command_velocity(now), **t))
                         if now - self._last_diagnostic >= 0.25:
                             self._last_diagnostic = now
                             self.log(f"TRACK t={now:.3f} goal={math.degrees(self.goal):+.2f} deg command={math.degrees(self.setpoint):+.2f} deg actual={math.degrees(t['position_rad']):+.2f} deg velocity={math.degrees(t['velocity_rad_s']):+.2f} deg/s torque={t['torque_nm']:+.3f} Nm fault={t['fault']}")
-                        if t['status'] != 1 or t['fault'] != 0:
+                        if t['status'] != 2 or t['fault'] != 0:
                             raise RuntimeError(f"Motor stopped or faulted: {t['fault_desc']}")
                     except Exception as exc:
                         try:
@@ -252,7 +316,11 @@ class KneeBridge:
     def close(self):
         self.stop_event.set()
         self.thread.join()
-        self.disarm()
+        try:
+            self.disarm()
+        finally:
+            if self.ankle:
+                self.ankle.close()
 
 
 class BridgeServer(ThreadingHTTPServer):
@@ -307,7 +375,7 @@ def make_handler(bridge, token, port):
                 payload = json.loads(self.rfile.read(size))
                 route = urlsplit(self.path).path
                 if route == '/api/update':
-                    bridge.update(payload['angle_deg'], payload['running'], payload.get('mode', 'manual'))
+                    bridge.update(payload['angle_deg'], payload['running'], payload.get('mode', 'manual'), payload.get('velocity_deg_s', 0.0), payload.get('extensions_mm'))
                 elif route == '/api/arm':
                     bridge.arm()
                 elif route == '/api/disarm':
@@ -327,22 +395,32 @@ def make_handler(bridge, token, port):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--ankle-speed-mm-s', type=float, default=20.0, help='ankle command speed limit, mm/s')
+    parser.add_argument('--ankle-response-time', type=float, default=0.10, help='ankle smoothing time per stage, seconds; higher is softer')
+    parser.add_argument('--ankle-port', default='COM7', help='Seenpin serial CAN-FD adapter')
+    parser.add_argument('--no-ankle', action='store_true', help='Run knee only')
     parser.add_argument('--port', type=int, default=8000)
     parser.add_argument('--sign', type=int, choices=(-1, 1), default=1, help='motor direction relative to simulator')
     parser.add_argument('--offset-deg', type=float, default=0, help='motor angle at zero simulator flexion')
-    for name, default in SERVO_DEFAULTS.items():
+    for name, default in PTM_DEFAULTS.items():
         parser.add_argument('--' + name.replace('_', '-'), type=float, default=default,
-                            help=f'servo gain, default {default}; protocol range 0..{SERVO_MAX[name]}')
+                            help=f'P-T-M position gain, default {default}; protocol range 0..{PTM_MAX[name]}')
     args = parser.parse_args()
     try:
-        gains = validate_gains({name: getattr(args, name) for name in SERVO_DEFAULTS})
+        gains = validate_gains({name: getattr(args, name) for name in PTM_DEFAULTS})
+        validate_mapping(args.sign, math.radians(args.offset_deg))
+        if not all(math.isfinite(x) and x > 0 for x in (args.ankle_speed_mm_s, args.ankle_response_time)):
+            raise ValueError('Ankle speed and smoothing time must be positive and finite')
     except ValueError as exc:
         parser.error(str(exc))
-    if not math.isfinite(args.offset_deg) or any(not -12.5 <= p <= 12.5 for p in (math.radians(args.offset_deg), math.radians(args.offset_deg) + args.sign * SIM_MAX)):
-        parser.error('mapped knee range must fit within the motor position range')
     from motorevo_driver import MotorevoMotor
     trace = CanTrace()
-    bridge = KneeBridge(partial(MotorevoMotor, motor_id=1, interface='pcan', channel='PCAN_USBBUS1', bitrate=1000000, trace=trace), args.sign, math.radians(args.offset_deg), log=trace.message, gains=gains)
+    ankle = None
+    if not args.no_ankle:
+        from ankle_bridge import AnkleBridge
+        from seenpin_driver import SeenpinActuators
+        ankle = AnkleBridge(partial(SeenpinActuators, port=args.ankle_port, log=trace.message), log=trace.message, max_speed=args.ankle_speed_mm_s, response_time=args.ankle_response_time)
+    bridge = KneeBridge(partial(MotorevoMotor, motor_id=1, interface='pcan', channel='PCAN_USBBUS1', bitrate=1000000, theta_min=THETA_MIN, theta_max=THETA_MAX, trace=trace), args.sign, math.radians(args.offset_deg), log=trace.message, gains=gains, ankle=ankle)
     server = None
     try:
         try:
@@ -356,7 +434,8 @@ def main():
             raise
         print(f'Open http://127.0.0.1:{args.port}/  (Ctrl+C to stop)', flush=True)
         print('CAN trace: TX = accepted by adapter; RX = received frame; TIMEOUT = no reply.', flush=True)
-        print(f'Servo gains (requested, quantized to 8-bit CAN fields): {gains}', flush=True)
+        print(f'P-T-M control (status 2), position scale 0..1.83 rad, 50 Hz direct simulator tracking; gains (12-bit): {gains}', flush=True)
+        print('Ankle disabled (--no-ankle)' if args.no_ankle else f'Ankle: {args.ankle_port}, CAN-FD+BRS 1M/5M, nodes 1/2/3; soft motion {args.ankle_speed_mm_s:g} mm/s, filter {args.ankle_response_time:g} s; opens on Arm knee + ankle', flush=True)
         server.serve_forever()
     except KeyboardInterrupt:
         pass

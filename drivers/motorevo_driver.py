@@ -4,6 +4,7 @@ Supports PEAK-CAN (PCAN-USB) on Windows & SocketCAN on Linux (Jetson / RPi).
 """
 
 import time
+import struct
 import can
 from typing import Optional, Dict, Any
 
@@ -124,6 +125,28 @@ class MotorevoMotor:
                 self.trace(event, arbitration_id, bytes(data), detail)
             except Exception:
                 pass  # diagnostics must never interrupt motor control
+
+    def read_parameter(self, index, data_type='float', timeout=0.25):
+        """Read one manufacturer parameter. Never writes settings or changes state."""
+        if not 0 <= index <= 255 or data_type not in ('float', 'int', 'uint'):
+            raise ValueError('Invalid motor parameter request')
+        can_id = 0x600 + self.motor_id
+        data = bytes([0x67, index, 0, 0, 0, 0, 0x04, 0x76])
+        self.bus.send(can.Message(arbitration_id=can_id, data=data, is_extended_id=False))
+        self._trace('TX PARAM', can_id, data, f'read index {index}')
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            response = self.bus.recv(timeout=max(0, deadline - time.monotonic()))
+            if response is None:
+                continue
+            self._trace('RX', response.arbitration_id, response.data, '')
+            raw = response.data
+            if (response.arbitration_id == can_id and not response.is_extended_id and
+                    not response.is_remote_frame and not response.is_error_frame and
+                    len(raw) == 8 and raw[0] == self.motor_id and raw[1] == index and
+                    raw[6] == 0 and raw[7] == 0xFF):
+                return struct.unpack({'float': '<f', 'int': '<i', 'uint': '<I'}[data_type], raw[2:6])[0]
+        raise RuntimeError(f'Knee parameter {index} read timed out; configuration is unverified')
 
     def enter_rest_mode(self) -> Optional[Dict[str, Any]]:
         """Enter Rest state (disables torque and clears clearable faults)."""
