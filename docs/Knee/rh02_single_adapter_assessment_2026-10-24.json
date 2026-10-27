@@ -1,0 +1,216 @@
+{
+  "date": "2026-10-24",
+  "adapter": "Jhoinrch RH02, SLCAN 105",
+  "port": "COM7",
+  "can_channels": 1,
+  "knee_only_parameter_reads": {
+    "11": 2,
+    "23": 4.095345497131348,
+    "24": 0.0,
+    "25": 1.8300000429153442,
+    "56": 4294967295
+  },
+  "shared_bus_parameter_reads": {},
+  "shared_bus_observations": {
+    "b:0x701:DLC0": 4,
+    "b:0x702:DLC0": 4,
+    "b:0x703:DLC0": 4,
+    "b:0x581:DLC4": 1
+  },
+  "shared_bus_error": "No classic CAN knee reply for parameter 11; stopped further requests",
+  "movement_commands_sent": false,
+  "motor_parameter_writes_sent": false,
+  "conclusion": "All four devices communicated through the single RH02 with all powered. Knee parameter reads succeeded, but a repeated knee read later failed after three attempts; adapter reported a frame-format error. All ankle fault and position reads succeeded with fault 0. Both knee parameter traffic and ankle node 1 SDO requests use 0x601; ankle SDO aborts were observed during knee reads. Mixed frame compatibility, identifier overlap and sustained motion-load reliability remain unresolved. Earlier silence is not proof of incompatibility.",
+  "bridge_changed": true,
+  "all_powered_recheck": {
+    "port": "COM7",
+    "setup": "user powered ankle drives again; knee and ankle share RH02",
+    "can_transmit_format": "classic CAN parameter reads only",
+    "motor_state_commands_sent": false,
+    "parameter_writes_sent": false,
+    "knee_parameters": {
+      "11": 2,
+      "23": 4.095345497131348,
+      "24": 0.0,
+      "25": 1.8300000429153442,
+      "56": 4294967295
+    },
+    "rx_frames": {
+      "b:0x703:DLC0": 28,
+      "b:0x701:DLC0": 28,
+      "b:0x702:DLC0": 28,
+      "t:0x601:DLC8": 5,
+      "b:0x581:DLC4": 11
+    },
+    "adapter_messages": [
+      ">Nominal: 1M baud, 75.0%; Data: 5M baud, 75.0%; Perfect match: No",
+      "E00000001",
+      "E02000001",
+      "E00000001"
+    ],
+    "attempts": [
+      {
+        "parameter": 11,
+        "attempt": 1,
+        "reply_received": true
+      },
+      {
+        "parameter": 23,
+        "attempt": 1,
+        "reply_received": true
+      },
+      {
+        "parameter": 24,
+        "attempt": 1,
+        "reply_received": false
+      },
+      {
+        "parameter": 24,
+        "attempt": 2,
+        "reply_received": true
+      },
+      {
+        "parameter": 25,
+        "attempt": 1,
+        "reply_received": true
+      },
+      {
+        "parameter": 56,
+        "attempt": 1,
+        "reply_received": true
+      }
+    ]
+  },
+  "repeated_four_motor_readback": {
+    "port": "COM7",
+    "setup": "all four powered on one RH02",
+    "read_only": true,
+    "samples": [
+      {
+        "round": 1,
+        "device": "knee",
+        "control_mode": 2,
+        "attempts": 1
+      },
+      {
+        "round": 1,
+        "device": "ankle1",
+        "fault": 0,
+        "fault_attempts": 1,
+        "position_mm": 14.24,
+        "position_mm_attempts": 1
+      },
+      {
+        "round": 1,
+        "device": "ankle2",
+        "fault": 0,
+        "fault_attempts": 1,
+        "position_mm": 24.0,
+        "position_mm_attempts": 1
+      },
+      {
+        "round": 1,
+        "device": "ankle3",
+        "fault": 0,
+        "fault_attempts": 1,
+        "position_mm": 23.39,
+        "position_mm_attempts": 1
+      },
+      {
+        "round": 2,
+        "device": "knee",
+        "control_mode": 2,
+        "attempts": 1
+      },
+      {
+        "round": 2,
+        "device": "ankle1",
+        "fault": 0,
+        "fault_attempts": 1,
+        "position_mm": 14.24,
+        "position_mm_attempts": 1
+      },
+      {
+        "round": 2,
+        "device": "ankle2",
+        "fault": 0,
+        "fault_attempts": 1,
+        "position_mm": 24.0,
+        "position_mm_attempts": 1
+      },
+      {
+        "round": 2,
+        "device": "ankle3",
+        "fault": 0,
+        "fault_attempts": 1,
+        "position_mm": 23.39,
+        "position_mm_attempts": 1
+      },
+      {
+        "round": 3,
+        "device": "knee",
+        "control_mode": null,
+        "attempts": 3
+      },
+      {
+        "round": 3,
+        "device": "ankle1",
+        "fault": 0,
+        "fault_attempts": 1,
+        "position_mm": 14.24,
+        "position_mm_attempts": 1
+      },
+      {
+        "round": 3,
+        "device": "ankle2",
+        "fault": 0,
+        "fault_attempts": 1,
+        "position_mm": 24.0,
+        "position_mm_attempts": 1
+      },
+      {
+        "round": 3,
+        "device": "ankle3",
+        "fault": 0,
+        "fault_attempts": 1,
+        "position_mm": 23.39,
+        "position_mm_attempts": 1
+      }
+    ],
+    "adapter_messages": [
+      ">Nominal: 1M baud, 75.0%; Data: 5M baud, 75.0%; Perfect match: No",
+      "E00000001",
+      ">Measured transceiver chip delay: 137 ns",
+      "E02000001",
+      "E00000001"
+    ],
+    "frame_counts": {
+      "t:0x601": 2,
+      "b:0x581": 13,
+      "b:0x703": 22,
+      "b:0x701": 22,
+      "b:0x702": 22,
+      "b:0x582": 6,
+      "b:0x583": 6
+    },
+    "ankle_abort_frames": [
+      "80 0b 00 00",
+      "80 0b 02 00",
+      "80 0b 00 00",
+      "80 0b 02 00",
+      "80 0b 00 00"
+    ]
+  },
+  "implementation": {
+    "default_interface": "shared RH02 on COM7",
+    "classic_knee_can_id": 1,
+    "can_fd_ankle_nodes": [
+      1,
+      2,
+      3
+    ],
+    "single_serial_receiver": true,
+    "latched_adapter_errors_stop_controllers": true,
+    "motion_validation": "Not performed; prior intermittent shared-bus failures remain unresolved"
+  }
+}

@@ -18,6 +18,11 @@ class FakeMotor:
         self.commands = []
         self.fault = 0
         self.parameters = {11: 2, 23: 0.0, 24: 0.0, 25: 1.83, 37: 1000, 47: 1, 56: 0xFFFFFFFF}
+        self.parameters.update({26:-10.,27:10.,28:0.,29:250.,30:0.,31:50.,34:-50.,35:50.})
+        self.vel_min,self.vel_max=-10.,10.
+        self.kp_min,self.kp_max=0.,250.
+        self.kd_min,self.kd_max=0.,50.
+        self.torque_min,self.torque_max=-50.,50.
 
     def read_parameter(self, index, data_type="float"):
         return self.parameters[index]
@@ -261,6 +266,30 @@ class BridgeTests(unittest.TestCase):
                 self.bridge.zero()
         self.assertFalse(self.bridge.armed)
 
+    def test_position_fault_blocks_zero_and_preserves_cause_on_rearm(self):
+        feedback = {**self.motor.feedback(0), 'position_rad': 0.0,
+                    'fault': 13, 'fault_desc': 'Position Out of Range'}
+        with patch.object(self.motor, 'enter_rest_mode', return_value=feedback), patch.object(self.motor, 'set_zero_position', create=True) as zero:
+            with self.assertRaisesRegex(RuntimeError, 'fault 13 .*Position Out of Range'):
+                self.bridge.zero()
+            zero.assert_not_called()
+        self.assertEqual(self.bridge.feedback, feedback)
+        self.bridge.update(0, True)
+        with self.assertRaisesRegex(RuntimeError, 'Previous knee zero verification failed:.*fault 13'):
+            self.bridge.arm()
+        self.assertNotIn('arm', self.motor.calls)
+        self.assertFalse(self.motor.commands)
+
+    def test_successful_zero_retry_clears_failed_verification(self):
+        self.bridge.zero_verification = dict(command_confirmed=False, error='old failure')
+        feedback = {**self.motor.feedback(0), 'position_rad': 0.0}
+        with patch.object(self.motor, 'enter_rest_mode', return_value=feedback), patch.object(self.motor, 'set_zero_position', return_value=feedback, create=True):
+            self.bridge.zero()
+        self.assertTrue(self.bridge.zero_verification['command_confirmed'])
+        self.bridge.update(0, False)
+        self.bridge.arm()
+        self.assertTrue(self.bridge.armed)
+
     def test_machine_offset_changed_externally_blocks_arming(self):
         self.bridge.zero_verification = dict(command_confirmed=True, machine_offset_after_rad=0.0)
         self.motor.parameters[23] = 1.0
@@ -309,7 +338,7 @@ class DriverTraceTests(unittest.TestCase):
             with self.subTest(angle=angle), patch('motorevo_driver.can.Bus') as factory:
                 motor = MotorevoMotor(theta_min=0, theta_max=THETA_MAX)
                 reply = [2, expected_position >> 8, expected_position & 255, 0x7f, 0xf7, 0xff, 0, 27]
-                factory.return_value.recv.return_value = can.Message(arbitration_id=1, data=reply)
+                factory.return_value.recv.return_value = can.Message(arbitration_id=1, data=reply, is_extended_id=False)
                 feedback = motor.send_ptm_command(math.radians(angle), kp=20, kd=4)
                 sent = factory.return_value.send.call_args.args[0]
                 self.assertEqual(sent.arbitration_id, 1)

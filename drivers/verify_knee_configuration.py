@@ -2,7 +2,7 @@
 import argparse
 import json
 from motorevo_driver import MotorevoMotor
-from knee_safety import read_configuration, validate_configuration
+from knee_safety import read_configuration, validate_configuration, POSITION_GUARD_RAD
 
 
 def main():
@@ -14,7 +14,7 @@ def main():
                   power_cycle_persistence_verified=False, physical_travel_guaranteed=False)
     try:
         report['configuration'] = read_configuration(motor)
-        validate_configuration(report['configuration'])
+        validate_configuration(report['configuration'], guard_band=POSITION_GUARD_RAD, allow_wide_range=True)
         report['configuration_matches_bridge'] = True
         result = 0
     except Exception as exc:

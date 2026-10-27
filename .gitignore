@@ -4,3 +4,7 @@ __pycache__/
 
 # Local scratch output and downloaded temporary tools
 /tmp/
+
+# Local motor calibration and online settings
+/drivers/bridge_settings.json
+/drivers/bridge_settings.tmp

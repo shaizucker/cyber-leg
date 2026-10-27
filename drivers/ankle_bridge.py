@@ -13,6 +13,8 @@ class AnkleBridge:
         self.log = log or (lambda message: None)
         self.lock = threading.RLock()
         self.wake = threading.Event()
+        self.idle = threading.Event()
+        self.idle.set()
         self.stop = threading.Event()
         self.wanted = self.armed = self.arming = False
         self.targets = self.command = None
@@ -21,6 +23,12 @@ class AnkleBridge:
         self.running = False
         self.updated = 0.0
         self.error = None
+        self.reference_mm = [20.0, 20.0, 20.0]
+        self.soft_limits_mm = None
+        self.shared_pid = None
+        self.expected_current_limits_a = None
+        self.telemetry = [{}, {}, {}]
+        self.enable_monitoring = False
         self.generation = 0
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
@@ -31,8 +39,12 @@ class AnkleBridge:
                 not math.isfinite(x) or not 0 <= x <= 50 for x in targets):
             raise ValueError('Provide three finite ankle extensions in mm, each 0..50')
         with self.lock:
+            targets = [origin + value - 20 for origin, value in zip(self.reference_mm, targets)]
             if self.limits and any(not lo <= x <= hi for x, (lo, hi) in zip(targets, self.limits)):
                 raise ValueError('Ankle target exceeds measured drive limits')
+            if self.soft_limits_mm and any(not lo <= x-origin <= hi for x, origin, (lo, hi)
+                    in zip(targets, self.reference_mm, self.soft_limits_mm)):
+                raise ValueError('Ankle target exceeds configured limits relative to zero')
             self.targets = list(targets)
             self.running = running
             self.updated = time.monotonic()
@@ -60,8 +72,16 @@ class AnkleBridge:
 
     def status(self):
         with self.lock:
+            limits = self.soft_limits_mm
+            if limits is None and self.limits:
+                limits = [[lo-origin, hi-origin] for (lo,hi),origin in zip(self.limits,self.reference_mm)]
             return dict(enabled=True, armed=self.armed, arming=self.arming,
-                        error=self.error, max_speed_mm_s=self.max_speed, response_time_s=self.response_time, nodes=[1, 2, 3], limits_mm=self.limits,
+                        closing=not self.wanted and not self.idle.is_set(),
+                        error=self.error, max_speed_mm_s=self.max_speed, response_time_s=self.response_time, nodes=[1, 2, 3],
+                        limits_mm=None if limits is None else [[lo+20,hi+20] for lo,hi in limits],
+                        hardware_limits_mm=self.limits, reference_mm=list(self.reference_mm),
+                        relative_positions_mm=None if self.positions is None else [p-z for p,z in zip(self.positions,self.reference_mm)],
+                        shared_pid=self.shared_pid, telemetry=[dict(t) for t in self.telemetry],
                         positions_mm=None if self.positions is None else list(self.positions),
                         command_mm=None if self.command is None else list(self.command))
 
@@ -71,12 +91,30 @@ class AnkleBridge:
             self.wake.clear()
             with self.lock:
                 wanted, generation = self.wanted, self.generation
+                if wanted:
+                    self.idle.clear()
             if not wanted:
                 continue
             driver = None
             try:
                 driver = self.factory()
                 driver.initialize()
+                if self.enable_monitoring and hasattr(driver, 'enable_monitoring'):
+                    driver.enable_monitoring()
+                if self.soft_limits_mm and any(not low <= ref+lo < ref+hi <= high
+                        for (low,high),ref,(lo,hi) in zip(driver.limits,self.reference_mm,self.soft_limits_mm)):
+                    raise RuntimeError('Saved ankle limits exceed measured drive limits')
+                if self.soft_limits_mm and any(not lo-0.001 <= pos-ref <= hi+0.001
+                        for pos,ref,(lo,hi) in zip(driver.positions,self.reference_mm,self.soft_limits_mm)):
+                    raise RuntimeError('Measured actuator position is outside configured signed limits')
+                if self.expected_current_limits_a is not None:
+                    actual = [driver.read(n,0x2009,3)/100 for n in (1,2,3)]
+                    if any(abs(a-b)>0.005 for a,b in zip(actual,self.expected_current_limits_a)):
+                        raise RuntimeError('Actuator current limits differ from saved settings; read/apply configuration before arming')
+                if self.shared_pid is not None:
+                    actual = driver.read_position_pid()
+                    if any(any(abs(a-b)>0.000011 for a,b in zip(row,self.shared_pid)) for row in actual):
+                        raise RuntimeError('Ankle PID differs from saved group settings; read/apply configuration while disarmed')
                 with self.lock:
                     self.limits = [list(pair) for pair in driver.limits]
                     self.positions = list(driver.positions)
@@ -136,6 +174,8 @@ class AnkleBridge:
                         driver.poll(index)
                         with self.lock:
                             self.positions = list(driver.positions)
+                            if hasattr(driver, 'telemetry'):
+                                self.telemetry = [dict(driver.telemetry.get(n, {})) for n in (1,2,3)]
                         index = (index + 1) % 3
                         next_poll = time.monotonic() + 1 / 30
                     driver.listen(0.005)
@@ -157,6 +197,7 @@ class AnkleBridge:
                     self.armed = False
                     if generation == self.generation:
                         self.arming = False
+                    self.idle.set()
 
     def close(self):
         self.disarm()

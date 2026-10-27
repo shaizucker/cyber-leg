@@ -136,6 +136,37 @@ This utility sends only parameter-read frames. It does not send Rest, Enable, Ze
 
 A software command clamp, an encoder range and fault-triggered torque removal do not establish that physical motion can never exceed 105 degrees. Inertia, external loading, encoder/reference faults and power loss remain outside this command check. A physical travel guarantee needs an appropriately designed independent stop/protection mechanism and validation of the assembled system.
 
+### Knee operating zero and protection clearance (October 27, 2026)
+
+The normal bridge launcher now divides simulator knee angles and velocity
+feed-forward by two: a 50-degree simulator target commands 25 degrees of motor
+rotation relative to the selected reference. The hip remains one-to-one.
+Console knee angles use the inverse mapping so they remain in simulator joint
+degrees; raw feedback and TRACK motor angles remain motor degrees. The knee UI
+still spans 0..105 degrees, with maximum motor travel 0.915 rad from reference.
+CAN encoding continues to use the servo's actual Theta MIN/MAX parameters.
+
+The bridge now supports a motor protection range with up to one degree of
+clearance outside each operating endpoint. The operating mapping remains
+0..1.83 rad (the 105-degree UI endpoint still saturates at 1.83 rad). Full
+clearance is CAN Theta MIN -0.0174532925 and MAX 1.8474532925 rad. Protections
+remain enabled. Range parameters are read and validated before any Rest or
+Enable feedback is interpreted; the exact reported values scale command and
+feedback bytes. The explicit wide setting CAN Theta MIN **-12 rad** and
+MAX **+12 rad** is also supported for either rotary motor. Set servo parameters
+[24] and [25] to these values in Motor Parameter Studio; the bridge reads them
+on the next connection. Software targets remain knee 0..105 degrees and hip
+-30..30 degrees. Other wider arbitrary scales and ranges narrower than the
+original operating envelope are rejected. No range write occurs at normal startup.
+
+A confirmed diagnostic on a disarmed knee exposed approximately -4.56 degrees
+when its former zero-at-the-boundary feedback had shown 0.00 degrees. The
+temporary diagnostic range was restored immediately. The user subsequently
+confirmed the current pose as the intended new knee zero. Software range
+clearance does not repair an incorrect reference or clear every latched
+firmware fault; a fault-free stationary readback is still required for Arm.
+The bridge never enables a motor just to bypass a reported fault.
+
 
 After explicit user approval on October 24, 2026, parameter 56 was changed from 0xFFFFFF7C to 0xFFFFFFFF, the write acknowledgement was checked, Save Flash was sent, and all seven audited parameters were read again. Protection readback was 0xFFFFFFFF. Machine Angle Offset stayed 4.095345497131348 rad, Theta stayed 0..1.8300000429153442 rad, and all other audited values were unchanged. No movement, zero, Rest or Enable commands were sent. The verified before/after record is `knee_protection_verification_2026-10-24.json` in this directory. Save-command transmission and live readback are confirmed; persistence after power cycling and the physical reference/direction/travel remain unverified.
 
@@ -151,3 +182,12 @@ Initialization now reports separate hexadecimal drive faults and detailed positi
 The knee now holds its measured arming position with zero velocity feedforward while ankle startup is pending. Both joints start following simulator targets only after ankle startup is verified. This prevents the knee running the gait alone while the ankle connection is being checked.
 
 After restarting the bridge, reload the simulator, press **Arm knee + ankle**, and wait for `ANKLE nodes 1/2/3: fault-free startup confirmed; simulator tracking enabled`. If recovery fails, support and stop the mechanism before inspecting/restarting the affected drive. Re-arm explicitly afterward. Actual hardware recovery has not been verified by the automated tests.
+
+
+### Ankle node 3 disappears after startup (October 25, 2026)
+
+The restored two-adapter setup is retained. The knee reports healthy tracking while an ankle node 3 fault-register read (2010:05) times out after three 250 ms attempts; only heartbeat IDs 0x701 and 0x702 are observed during that failure. Green power indicators do not establish that node 3's CAN interface is communicating. The user confirmed PCAN/knee and RH02/ankles are on electrically separate buses. The cause is still unverified.
+
+The ankle driver now enables RH02 CAN error reporting with `ME` after its existing startup sequence and prints `ANKLE adapter report` messages. It records bounded link history, last heartbeat and SDO-reply times per node, and position-command write gaps. If all read attempts fail, `ANKLE LINK` lines show this evidence before the existing timeout stops both systems. A position TX timestamp measures the host write, not delivery or drive acceptance. No error reports received is not proof that the physical bus was error-free. Heartbeat ages are diagnostic only; they do not replace SDO feedback.
+
+No knee code, control gains, actuator motion format, speed/smoothing settings, poll rate, retry budget, persistent motor parameters or automatic recovery behavior changed. This is additional failure evidence, not a verified repair. On the next occurrence retain the `ANKLE adapter report` and `ANKLE LINK` lines together with the stop message. Long command gaps suggest host/USB scheduling; recent commands with missing node-3 replies and heartbeats point toward the node-3 drive or its bus branch, without proving the root cause.
