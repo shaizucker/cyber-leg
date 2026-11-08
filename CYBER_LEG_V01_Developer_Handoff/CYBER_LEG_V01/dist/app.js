@@ -71,7 +71,6 @@ async function bridgeTick(){
  finally{bridgeBusy=false;}
 }
 async function bridgeConnect(){
- if(location.hostname!=='127.0.0.1')return;
  try{const r=await fetch('/api/session',{cache:'no-store'});if(!r.ok)return;const data=await r.json();bridgeToken=data.token;bridgeDisplay(data);await bridgeTick();}
  catch(e){$('motorStatus').textContent='Bridge not connected';}
 }

@@ -1,5 +1,6 @@
 """Local simulator-to-hip-knee-and-ankle bridge. Run with --help for options."""
 import argparse
+import ipaddress
 import json
 import math
 import queue
@@ -16,6 +17,8 @@ from urllib.parse import urlsplit
 from knee_safety import read_configuration, validate_configuration, verify_command_scaling, POSITION_GUARD_RAD
 
 DT = 0.02
+CONTROL_OVERRUN_YIELD = 0.001  # Let queued HTTP updates acquire the state lock.
+FEEDBACK_TIMEOUT = 0.03  # Allow measured USB scheduling jitter; never retry motion commands.
 STALE_SECONDS = 0.5
 MAX_VELOCITY = 10.0  # Configured P-T-M velocity encoding range, rad/s.
 SIM_MAX_DEG = 105.0
@@ -93,7 +96,10 @@ def select_outputs(only='all', no_knee=False, no_hip=False, no_ankle=False):
 
 
 class KneeBridge:
-    def __init__(self, motor_factory, sign=1, offset=0, log=None, gains=None, ankle=None, hip=None, start_worker=True, theta_min=THETA_MIN, theta_max=THETA_MAX, sim_max_deg=SIM_MAX_DEG, joint_min_deg=0.0, angle_scale=1.0):
+    def __init__(self, motor_factory, sign=1, offset=0, log=None, gains=None, ankle=None, hip=None, start_worker=True, theta_min=THETA_MIN, theta_max=THETA_MAX, sim_max_deg=SIM_MAX_DEG, joint_min_deg=0.0, angle_scale=1.0, feedback_timeout=FEEDBACK_TIMEOUT):
+        if isinstance(feedback_timeout, bool) or not math.isfinite(feedback_timeout) or not .01 <= feedback_timeout <= .05:
+            raise ValueError('Rotary feedback timeout must be between 10 and 50 ms')
+        self.feedback_timeout = feedback_timeout
         self.theta_min, self.theta_max = theta_min, theta_max
         self.can_theta_min, self.can_theta_max = theta_min, theta_max
         self.sim_max_deg = sim_max_deg
@@ -412,6 +418,7 @@ class KneeBridge:
                     "motor_configuration": self.configuration, "zero_verification": self.zero_verification,
                     "setpoint_rad": self.setpoint, "goal_rad": self.goal,
                     "command_velocity_rad_s": self._command_velocity(time.monotonic()),
+                    "feedback_timeout_ms": self.feedback_timeout*1000,
                     "control_mode": "P-T-M", "max_angle_deg": self.sim_max_deg,
                     "hip": self.hip.status() if self.hip else {"enabled": False},
                     "ankle": self.ankle.status() if self.ankle else {"enabled": False},
@@ -441,14 +448,18 @@ class KneeBridge:
         return self.integral_nm
 
     def _control_step(self, now, elapsed):
+        # A previous joint may have used some of this cycle's reply budget.
+        now = time.monotonic()
+        if now - self.last_update > STALE_SECONDS:
+            raise RuntimeError('Simulator connection lost; motor disarmed')
         self._advance_setpoint(now, elapsed)
         if not math.isfinite(self.setpoint) or not self.theta_min <= self.setpoint <= self.theta_max:
             raise RuntimeError('Joint command outside the verified position range')
         t = self.motor.send_ptm_command(
             self.setpoint, vel_rad_s=self._command_velocity(now), kp=self.gains['kp_pos'],
-            kd=self.gains['kd_pos'], torque_ff_nm=self._integral_command(elapsed), timeout=0.01)
+            kd=self.gains['kd_pos'], torque_ff_nm=self._integral_command(elapsed), timeout=self.feedback_timeout)
         if not t:
-            raise RuntimeError("Motor feedback timed out")
+            raise RuntimeError(f'Motor feedback timed out after {self.feedback_timeout*1000:g} ms')
         self.feedback = t
         self.feedback_at = time.monotonic()
         self.samples.append(dict(t=time.monotonic(), goal_rad=self.goal,
@@ -509,8 +520,11 @@ class KneeBridge:
             delay = next_t - time.monotonic()
             if delay <= 0:
                 next_t = time.monotonic()
-            else:
-                self.stop_event.wait(delay)
+                # Both CAN transactions run under the state lock. Reacquiring
+                # it immediately after every overrun can starve HTTP updates
+                # until their unchanged 500 ms watchdog expires.
+                delay = CONTROL_OVERRUN_YIELD
+            self.stop_event.wait(delay)
 
     def close(self):
         self.stop_event.set()
@@ -565,7 +579,8 @@ class BridgeServer(ThreadingHTTPServer):
         super().server_bind()
 
 
-def make_handler(bridge, token, port):
+def make_handler(bridge, token, port, host='127.0.0.1'):
+    authority = f'{host}:{port}'
     class Handler(SimpleHTTPRequestHandler):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, directory=str(DIST), **kwargs)
@@ -597,7 +612,7 @@ def make_handler(bridge, token, port):
             return True
 
         def do_GET(self):
-            if self.headers.get('Host') != f'127.0.0.1:{port}':
+            if self.headers.get('Host') != authority:
                 self.send_error(403)
             elif urlsplit(self.path).path == '/api/session':
                 self.reply(200, {'token': token, **bridge.status()})
@@ -612,8 +627,8 @@ def make_handler(bridge, token, port):
                 super().do_GET()
 
         def do_POST(self):
-            if (self.headers.get('Host') != f'127.0.0.1:{port}' or
-                self.headers.get('Origin') != f'http://127.0.0.1:{port}' or
+            if (self.headers.get('Host') != authority or
+                self.headers.get('Origin') != f'http://{authority}' or
                 self.headers.get('X-Bridge-Token') != token or
                 self.headers.get_content_type() != 'application/json'):
                 # Drain a small, already-sent body before closing. Otherwise
@@ -687,8 +702,8 @@ def main():
     parser.add_argument('--ankle-speed-mm-s', type=float, default=20.0, help='ankle command speed limit, mm/s')
     parser.add_argument('--ankle-response-time', type=float, default=0.10, help='ankle smoothing time per stage, seconds; higher is softer')
     parser.add_argument('--ankle-port', default='/dev/ttyACM0' if sys.platform.startswith('linux') else 'COM7', help='Seenpin serial CAN-FD adapter; accepts /dev/serial/by-id paths')
-    parser.add_argument('--can-interface', choices=('pcan', 'socketcan'), default='socketcan' if sys.platform.startswith('linux') else 'pcan', help='rotary CAN backend (Linux: socketcan; Windows: pcan)')
-    parser.add_argument('--can-channel', help='rotary CAN channel (socketcan: can1; pcan: PCAN_USBBUS1)')
+    parser.add_argument('--can-interface', choices=('pcan', 'socketcan', 'slcan'), default='socketcan' if sys.platform.startswith('linux') else 'pcan', help='rotary CAN backend: socketcan, pcan, or Teensy USB serial slcan')
+    parser.add_argument('--can-channel', help='rotary CAN channel (socketcan: can1; pcan: PCAN_USBBUS1; slcan: explicit Teensy serial path)')
     parser.add_argument('--only', choices=('all', 'knee', 'hip', 'ankle'), default='all', help='physical outputs to operate (default: all)')
     parser.add_argument('--no-knee', action='store_true', help='Disable knee output')
     parser.add_argument('--no-ankle', action='store_true', help='Disable ankle outputs')
@@ -700,6 +715,9 @@ def main():
     parser.add_argument('--config-file', default=str(Path(__file__).with_name('bridge_settings.json')), help='persistent online settings and zero-reference profile')
     parser.add_argument('--no-config-save', action='store_true', help='keep online settings for this session only')
     parser.add_argument('--port', type=int, default=8000)
+    parser.add_argument('--feedback-timeout-ms', type=float, default=FEEDBACK_TIMEOUT*1000,
+                        help='rotary reply deadline, 10..50 ms (default 30); missing feedback still disarms')
+    parser.add_argument('--bind', default='127.0.0.1', help='explicit IPv4 address to serve; use the Jetson LAN IP for remote control')
     parser.add_argument('--sign', type=int, choices=(-1, 1), default=1, help='motor direction relative to simulator')
     parser.add_argument('--offset-deg', type=float, default=0, help='motor angle at zero simulator flexion')
     for name, default in PTM_DEFAULTS.items():
@@ -707,8 +725,14 @@ def main():
                             help=f'P-T-M position gain, default {default}; protocol range 0..{PTM_MAX[name]}')
     args = parser.parse_args()
     if args.can_channel is None:
+        if args.can_interface == 'slcan':
+            parser.error('SLCAN requires --can-channel with the Teensy serial path; do not use the ankle adapter')
         args.can_channel = 'can1' if args.can_interface == 'socketcan' else 'PCAN_USBBUS1'
     try:
+        if ipaddress.IPv4Address(args.bind).is_unspecified:
+            raise ValueError('Use an explicit bind address, not 0.0.0.0')
+        if not math.isfinite(args.feedback_timeout_ms) or not 10 <= args.feedback_timeout_ms <= 50:
+            raise ValueError('Rotary feedback timeout must be between 10 and 50 ms')
         outputs = select_outputs(args.only, args.no_knee, args.no_hip, args.no_ankle)
         gains = validate_gains({name: getattr(args, name) for name in PTM_DEFAULTS})
         validate_mapping(args.sign, math.radians(args.offset_deg))
@@ -728,9 +752,11 @@ def main():
     network = SharedMotorNetwork(interface=args.can_interface, channel=args.can_channel, bitrate=1000000,
                                  theta_min=THETA_MIN, theta_max=THETA_MAX, trace=trace)
     hip = None if 'hip' not in outputs else HipBridge(partial(network.motor, 2, theta_min=HIP_THETA_MIN, theta_max=HIP_THETA_MAX), sign=args.hip_sign,
-                    offset=math.radians(args.hip_offset_deg), log=trace.message, gains=hip_gains)
+                    offset=math.radians(args.hip_offset_deg), log=trace.message, gains=hip_gains,
+                    feedback_timeout=args.feedback_timeout_ms/1000)
     bridge = KneeBridge(partial(network.motor, 1) if 'knee' in outputs else None, args.sign, math.radians(args.offset_deg),
-                        log=trace.message, gains=gains, ankle=ankle, hip=hip, angle_scale=KNEE_ANGLE_SCALE)
+                        log=trace.message, gains=gains, ankle=ankle, hip=hip, angle_scale=KNEE_ANGLE_SCALE,
+                        feedback_timeout=args.feedback_timeout_ms/1000)
     from motor_console import MotorConsole
     try:
         MotorConsole(bridge, None if args.no_config_save else args.config_file)
@@ -741,16 +767,17 @@ def main():
     server = None
     try:
         try:
-            server = BridgeServer(('127.0.0.1', args.port), make_handler(bridge, secrets.token_urlsafe(32), args.port))
+            server = BridgeServer((args.bind, args.port), make_handler(bridge, secrets.token_urlsafe(32), args.port, args.bind))
         except OSError as exc:
             if getattr(exc, 'winerror', None) in (10048, 10013) or exc.errno in (98, 48):
                 print(f'Cannot open port {args.port}: another bridge or application may already be using it. '
                       'Stop the existing bridge with Ctrl+C in its terminal, then retry. '
-                      f'Alternatively, open http://127.0.0.1:{args.port}/ to use the running bridge.', flush=True)
+                      f'Alternatively, open http://{args.bind}:{args.port}/ to use the running bridge.', flush=True)
                 raise SystemExit(1) from None
             raise
-        print(f'Open http://127.0.0.1:{args.port}/  (Ctrl+C to stop)', flush=True)
+        print(f'Open http://{args.bind}:{args.port}/  (Ctrl+C to stop)', flush=True)
         print('CAN trace: TX = accepted by adapter; RX = received frame; TIMEOUT = no reply.', flush=True)
+        print(f'Rotary timing: nominal 50 Hz, reply deadline {args.feedback_timeout_ms:g} ms per joint; missing feedback disarms, no motion-command retries', flush=True)
         if 'knee' in outputs:
             print(f'P-T-M control (status 2), knee angle scale {KNEE_ANGLE_SCALE:g} (simulator angle divided by 2); CAN scale read from motor (joint range with up to 1 degree margin, or -12..12 rad); 50 Hz tracking; gains (12-bit): {gains}', flush=True)
         print('Physical outputs: ' + ', '.join(bridge.status()['outputs']), flush=True)

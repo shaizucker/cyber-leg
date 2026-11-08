@@ -296,7 +296,12 @@ class SharedMotorNetwork:
     def motor(self, motor_id, **overrides):
         with self.lock:
             if self.bus is None:
-                self.bus = can.Bus(**{key: self.options[key] for key in ('interface', 'channel', 'bitrate')})
+                transport = {key: self.options[key] for key in ('interface', 'channel', 'bitrate')}
+                if transport['interface'] == 'slcan':
+                    # The Teensy does not reset on CDC open. Avoid python-can's
+                    # default two-second startup sleep while the arm lock is held.
+                    transport.update(sleep_after_open=0, tty_baudrate=115200)
+                self.bus = can.Bus(**transport)
             return MotorevoMotor(motor_id=motor_id, bus=self.bus, bus_lock=self.lock, **{**self.options, **overrides})
 
     def close(self):

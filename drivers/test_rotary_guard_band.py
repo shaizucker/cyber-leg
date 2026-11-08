@@ -154,6 +154,9 @@ class GuardBandTests(unittest.TestCase):
         try:
             joint.update(50, True, mode='auto', velocity_deg_s=20)
             joint.arm()
+            # Arming includes a 50 ms Rest-to-Motor delay; velocity requires a
+            # fresh browser sample rather than a synthetic old command time.
+            joint.update(50, True, mode='auto', velocity_deg_s=20)
             joint._control_step(joint.last_update, .02)
             command = self.motor.commands[-1]
             self.assertAlmostEqual(command[1], math.radians(25))

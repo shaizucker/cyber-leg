@@ -1,1 +1,2 @@
 drivers/dotnet-sdk-8.0.100-win-x64.exe filter=lfs diff=lfs merge=lfs -text
+*.sh text eol=lf

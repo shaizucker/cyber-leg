@@ -1,84 +1,93 @@
-# Cyber-Leg Prosthetic Control System — Project Status
+# Cyber-Leg Prosthetic Control System - Project Status
 
-**Last Updated:** October 18, 2026  
-**Workspace:** `C:\cyber-leg`  
-**Phase:** Phase 1 — Baseline Actuator Bringup & Communication
+**Last updated:** November 8, 2026
 
----
+**Branch:** `feature/hip`
+**Phase:** Integrated bench commissioning on Jetson; sustained motion validation remains open.
 
-## 1. Hardware Architecture Overview
+See [PROJECT_CONTEXT.md](PROJECT_CONTEXT.md) for durable configuration,
+[WORKLOG.md](WORKLOG.md) for history, and [Jetson setup](docs/Jetson/setup.md)
+for installation and launch commands.
 
-| Subsystem | Actuator / Hardware | Interface | Bus Speed | Status |
-| :--- | :--- | :--- | :--- | :--- |
-| **Knee Joint** | Motorevo Rotary Actuator (`LTE1.1AN1800G`, 36:1 reducer) | CAN 2.0A | 1 Mbps | **Communication & Arming Verified** |
-| **Ankle Joint** | 3x Linear Actuators (Seenpin) | CAN-FD | TBD | Pending Phase 1 integration |
-| **Host / Controller** | PC / Workstation (Dev) $\rightarrow$ Raspberry Pi 5 / Jetson Orin Nano (Target) | PEAK-CAN USB $\rightarrow$ Native SocketCAN | 1 Mbps | **PCAN Driver operational** |
-| **Power Bus** | 48V DC Main Power Supply | XT30PW(2+2) | 48V | **Online (Green PWR LED active)** |
+## Current hardware architecture
 
----
+| Subsystem | Hardware | Connection | Confirmed status |
+|---|---|---|---|
+| Host | Jetson Orin Nano Super developer kit, about 8 GB RAM | `halalit@10.0.0.22`, aarch64; Jetson Linux 36.5.0, kernel 5.15.185-tegra | SSH key access; repository and Python environment installed |
+| Knee | Motorevo rotary motor ID 1 | Teensy 4.1 + TJA1051T/3 CAN Pal, classic CAN 1 Mbps | P-T-M mode 2; CAN Theta range -12..12 rad; parameter replies verified |
+| Hip | Same rotary motor model, ID 2 | Same Teensy classic-CAN bus | P-T-M mode 2; reported range approximately -30..30 degrees |
+| Ankle | Three Seenpin linear actuators, IDs 1/2/3 | Separate RH02 Plus USB serial CAN-FD adapter, 1 Mbps arbitration / 5 Mbps data with BRS | Fault-free replies at 19.96/19.97/20.01 mm; drive limits 0..39 mm |
+| Browser | Windows computer on the LAN | `http://10.0.0.22:8000/` | Simulator loads directly from Jetson; no SSH tunnel required |
 
-## 2. Knee Actuator Diagnostics & Configuration
+Ankle positions above are a dated commissioning snapshot, not a live state.
+Jetson serves the application and runs the bridge; the browser computes/renders
+the simulation and must continue sending fresh targets during control.
 
-Direct register dump retrieved from motor non-volatile Flash via CAN SDO (`ID: 0x601`):
+## USB adapter assignment
 
-- **Motor CAN ID:** `1` (`0x001`)
-- **Active Control Mode:** `Servo Mode` (3-loop controller: position PD, velocity PI, current FOC + sliding-mode observer)
-- **Gear Ratio:** `36.0:1`
-- **Pole Pairs (NPP):** `14`
-- **Continuous Torque Limit:** `15.0 Nm`
-- **Bus Protection Thresholds:** Overvoltage Lock = `80.0 V`, Undervoltage Lock = `10.0 V`
-- **Scaling Ranges (Default):**
-  - Position ($\theta$): `[-12.5, +12.5]` rad
-  - Velocity ($V$): `[-10.0, +10.0]` rad/s
-  - Torque ($\tau$): `[-50.0, +50.0]` Nm
-- **Physical Characteristics:**
-  - Rotor is free to backdrive by hand when unpowered or in Rest Mode.
-  - Driver status indicators: Green LED = Power OK; Blue LED = Motor State active.
+- Rotary: `/dev/serial/by-id/usb-Teensyduino_USB_Serial_18818090-if00`
+  (observed `/dev/ttyACM1`); use `--can-interface slcan`.
+- Ankle: `/dev/serial/by-id/usb-ElmueSoft__netcult.ch_elmue__Slcan_2.5_-_Jhoinrch_206B347745465015-if00`
+  (observed `/dev/ttyACM0`); uses the existing Seenpin CAN-FD transport.
+- Use persistent paths; ttyACM numbering may change after reconnecting.
+- PCAN-USB is now a bench reference, not the deployed rotary adapter.
+- Microchip 04d8:0a30 was tested but is not used for control. Its firmware
+  reports USB 2.0 / CAN 2.3. Tests observed delayed/missing replies; no firmware
+  update was performed because no PIC programmer was available.
+- The Teensy path needs neither SocketCAN `can1` nor a new kernel driver.
 
----
+## Firmware and transceiver
 
-## 3. Communication & Driver Progress
+- Firmware: [Teensy USB-CAN](firmware/teensy_usb_can/README.md), PlatformIO
+  environment `teensy41`, version response `V0101`.
+- CAN3 uses Teensy 31 TX and 30 RX. The photographed CAN Pal-style module
+  takes **3.3 V at Vcc**, has an onboard 5 V boost circuit and 3.3 V logic.
+  This differs from bare-chip separate 5 V VCC / 3.3 V VIO wiring.
+- Correcting swapped TX/RX wires restored bench traffic. PCAN received Teensy
+  ID 0x555 frames; Teensy received PCAN ID 0x123 / AA BB CC at 1 Mbps.
+- Firmware boots closed, flushes received frames promptly over USB, closes CAN
+  on DTR disconnect, and rejects malformed frames and busy TX.
+- Terminate at the two physical bus endpoints only. The CAN Pal switch adds
+  120 ohms when ON. Keep rotary and ankle CAN buses separate.
 
-### What Has Been Achieved
-1. **Transition to Industry-Standard Adapter:**
-   - Switched from the proprietary USB-UART "Jason" dongle to the **PEAK-CAN (PCAN-USB)** adapter.
-   - Driver installed and operational on `PCAN_USBBUS1` at 1 Mbps.
-2. **Protocol Validation:**
-   - Standard 11-bit CAN frame decoding and encoding verified against the Motorevo V3.5 driver specification.
-   - Real-time telemetry extraction (status, position, velocity, torque, fault code, PCB temperature) confirmed working.
-3. **Motor Arming & Torque Generation Verified:**
-   - Sent `Enter Motor State` (`0xFC`) command $\rightarrow$ driver successfully transitioned to **`Status: 0x01` (Motor State)**.
-   - Closed-loop holding torque generation confirmed (`+0.65 Nm`).
-4. **Watchdog Characterization:**
-   - Identified driver watchdog mechanism: if CAN command frames stop for more than `1000 ms`, the motor sets `Fault 16` (`0x10`, CAN Communication Interruption) and falls back to safe `Rest State`.
-   - Control loops must stream command frames continuously at 50 Hz (20 ms interval) during active motion.
+## Control behavior
 
----
+- Knee target and velocity mapping has a 0.5 motor-angle ratio: 50 simulator
+  degrees requests 25 motor degrees from reference. Hip remains one-to-one,
+  with simulator range -30..30 degrees.
+- Actual motor Theta readbacks scale CAN encoding/decoding; software command
+  limits remain separate from motor protection bounds.
+- Online panel: rotary PID/limits, grouped ankle PID, individual ankle telemetry
+  and current limits, signed reference capture. Machine-local profiles live in
+  ignored `drivers/bridge_settings.json`; preserve them during deployment.
+- No external power sensors are connected. Electrical consumption and rotary
+  supply voltage remain unavailable; phase current is not DC bus current.
+- Nominal cycle 20 ms / 50 Hz; rotary reply deadline 30 ms per joint,
+  configurable within 10..50 ms. Faults and missing feedback stop control.
+- Simulator freshness limit remains 500 ms. The rotary worker yields 1 ms
+  after an overrun to let HTTP updates acquire the state lock. No automatic
+  rearming or motion-command retries are added.
+- Explicit LAN bind `--bind 10.0.0.22` retains exact Host/Origin/token checks.
+  Startup is disarmed. Run in the Jetson terminal for live logs.
 
-## 4. Software Assets in `c:\cyber-leg`
+## Verification and remaining work
 
-- **[`drivers/motorevo_driver.py`](file:///c:/cyber-leg/drivers/motorevo_driver.py)**:
-  - Reusable, object-oriented Python driver (`MotorevoMotor`).
-  - Supports PEAK-CAN (`interface="pcan"`) on Windows.
-  - Ready for drop-in SocketCAN (`interface="socketcan"`, `channel="can0"`) deployment on Linux (Raspberry Pi 5 / Jetson Orin Nano).
-  - Implements state transitions (`enter_motor_mode`, `enter_rest_mode`, `set_zero_position`), Servo Mode commanding, and MIT Cheetah style P-T-M commanding.
-- **[`drivers/knee_control_cli.py`](file:///c:/cyber-leg/drivers/knee_control_cli.py)**:
-  - Interactive terminal CLI for live motor status reading, zeroing, arming, nudging, and safe disarming.
-- **[`drivers/test_pcan_motor.py`](file:///c:/cyber-leg/drivers/test_pcan_motor.py)**:
-  - Bus discovery and ping utility.
-- **[`drivers/test_rotation_45deg.py`](file:///c:/cyber-leg/drivers/test_rotation_45deg.py)**:
-  - Smooth S-curve trajectory executor for verified rotation tests.
+- 200 rotary parameter reads through Teensy succeeded: knee maximum 13.885 ms,
+  hip maximum 0.938 ms. This does not guarantee motion-loop performance.
+- Watchdog starvation was reproduced with fake motors on Jetson. After the
+  overrun-yield fix, the same reproduction stayed active and maximum update
+  wait fell from about 408 to 30 ms.
+- 145 affected hardware-free regression tests passed. Firmware parser checks
+  also passed with address/undefined-behavior sanitizers.
+- User-operated motion was reported before the watchdog stop. Sustained
+  full-leg tracking after the latest fix still needs physical verification.
+- Physical zero/persistence, load tuning, torque/current caps and actual travel
+  containment remain commissioning concerns. Old limits are not current readbacks.
 
----
+## Historical bring-up facts
 
-## 5. Next Steps
-
-1. **Knee Joint Motion Tuning:**
-   - Execute continuous 50 Hz position trajectory with tuned gains ($K_p \approx 40\text{–}60$, $K_d \approx 5\text{–}8$) to smoothly rotate through the 36:1 reducer.
-2. **Phase 1 Completion (Knee):**
-   - Establish baseline automated position sweep and angle repeatability test scripts.
-3. **Ankle Joint Integration:**
-   - Review Seenpin linear actuator documentation (`docs/Ankle/Seenpin V2.0 CAN-FD User Manual.docx`).
-   - Configure CAN-FD interface and verify communication with the 3 linear actuators.
-4. **GUI Development:**
-   - Build a lightweight unified GUI for simultaneously monitoring the knee angle and the 3 ankle linear actuators.
+The October 18 record identified knee model LTE1.1AN1800G, a 36:1 reducer and
+14 pole pairs. Initial PCAN telemetry/arming were verified; the main supply
+was recorded as 48 V and the rotary CAN watchdog as 1000 ms. That early record
+used Servo mode and different ranges. Current runtime uses P-T-M mode and the
+readbacks above; the old 15 Nm limit and trial gains are not current settings.
