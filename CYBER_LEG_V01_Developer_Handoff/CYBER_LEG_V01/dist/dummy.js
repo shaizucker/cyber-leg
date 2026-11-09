@@ -1,5 +1,5 @@
 import * as T from './three.module.min.js';
-import {gait,clamp,rad} from './motion.js';
+import {footPath,clamp,rad} from './motion.js';
 
 // Geometric two-link limb, with a forward knee. No dynamics or balance model.
 export function legIK(hip,ankle,upper=420,lower=420){
@@ -57,8 +57,9 @@ export class WalkingDummy{
   const hipWorld=this.root.localToWorld(this.hipLocal.clone());
   this.body.position.copy(hipWorld);this.body.rotation.set(0,0,0);this.body.updateMatrixWorld(true);
   const walking=state.mode==='auto',phase=walking?(state.phase+.5)%1:0;
-  const g=gait(phase),s=clamp((phase-.62)/.38,0,1);
-  const x=walking?(g.stance?100-350*phase:-117+217*s*s*(3-2*s)):hipWorld.x+30;
+  // Opposite leg uses the same belt-matched foot path, half a cycle out of phase.
+  const g=footPath(phase),s=g.stance?0:g.s;
+  const x=walking?hipWorld.x+g.x:hipWorld.x+30;
   const z=hipWorld.z-170,ankleWorld=new T.Vector3(x,heightAt(x,z)+38+(walking?g.lift:0),z);
   const target=this.body.worldToLocal(ankleWorld.clone());
   const solved=legIK(this.otherHip,target);

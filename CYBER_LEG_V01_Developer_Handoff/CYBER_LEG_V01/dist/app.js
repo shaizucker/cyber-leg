@@ -1,7 +1,7 @@
 import {installMotorConsole} from './motor-console.js';
 import {WalkingDummy} from './dummy.js';
 import * as THREE from './three.module.min.js';
-import {rad,clamp,terrain,makeStones,wrapStone,stoneProfile,surfaceHeight,supportSlope,gait,feasiblePose} from './motion.js';
+import {rad,clamp,terrain,makeStones,wrapStone,stoneProfile,surfaceHeight,supportSlope,feasiblePose,GAIT,gaitPose,gaitRates,hipHeight,smooth5} from './motion.js';
 const $=id=>document.getElementById(id);
 const state={ready:false,running:false,mode:'manual',time:0,phase:0,distance:0,knee:0,kneeVelocity:0,pitch:0,roll:0,height:0,hip:0,hipVelocity:0,correctionPitch:0,correctionRoll:0,extensions:[20,20,20],limited:false};
 let dummy;
@@ -12,6 +12,8 @@ const history=[],samples=[];let lastSample=0,lastTerrain=-1,baseGround=94.582;
 const orbit={theta:1.05,phi:1.27,radius:2750,target:new THREE.Vector3(25,820,-60)};
 const clock=new THREE.Clock();let drag=null,joyDrag=false,pointerDown=null;
 let ankleLimits=null;
+// Gait rig: fixed hip mount (world mm). u = knee->hip in the thigh frame (matches dummy.js hipLocal).
+const HIP_LOCAL=[-22,395];let rig=null;
 let bridgeToken=null,bridgeBusy=false,bridgeArmed=false,bridgeArmPending=false,bridgeGeneration=0,bridgeQueue=Promise.resolve();
 function applyMotorLimits(data){
  const rotary=data.console?.rotary;if(!rotary)return;
@@ -122,6 +124,7 @@ function buildRig(){
  // Keep a distributed sole sample for interactive ground clearance checks.
  const cells=new Map();for(const v of contactVertices){const key=`${Math.round(v.x/5)},${Math.round(v.z/5)}`;if(!cells.has(key)||cells.get(key).y>v.y)cells.set(key,v);}
  contactVertices=[...cells.values()];
+ rig={u:HIP_LOCAL,w:[anklePivot.x-kneePivot.x,anklePivot.y-kneePivot.y],contact:contactVertices.map(v=>v.toArray()),anchors,pivot:anklePivot.toArray(),limits:null,hipX:kneePivot.x+HIP_LOCAL[0],z:anklePivot.z};rig.hipY=hipHeight(rig);
  axisGroup=new THREE.Group();root.add(axisGroup);
  // Same rotary motor type as the knee; illustrative housing at the hip.
  const hipMotor=new THREE.Mesh(new THREE.CylinderGeometry(48,48,65,32),new THREE.MeshStandardMaterial({color:0x52c8bd,metalness:.65,roughness:.3}));
@@ -176,27 +179,30 @@ function updateTerrain(){
 function solvePose(dt){
  let basePitch=0,desiredPitch=0,desiredRoll=0,hip=+$('hip').value,knee=+$('knee').value,lift=0;
  state.correctionPitch=0;state.correctionRoll=0;
+ let pose,gp=null;
  if(state.mode==='auto'){
-  const g=gait(state.phase);hip=clamp(g.hip,+$('hip').min,+$('hip').max);knee=clamp(g.knee,+$('knee').min,+$('knee').max);lift=g.lift;
-  // In stance the sole tracks the ground; swing has bounded ankle dorsiflexion.
-  desiredPitch=clamp(-(hip-knee),-24,24);basePitch=desiredPitch;
-  const amp=$('uneven').checked?+$('roughness').value:0;
-  const support=g.stance?supportSlope(100-350*g.phase,0,state.distance,amp,$('stones').checked?stones:[],+$('stoneHeight').value):{pitch:0,roll:0,left:0,right:0};
-  const active=$('adaptive').checked&&g.stance;
-  const alpha=dt>0?1-Math.exp(-dt/.10):1;
-  filteredPitch+=((active?support.pitch:0)-filteredPitch)*alpha;
-  filteredRoll+=((active?support.roll:0)-filteredRoll)*alpha;
-  desiredPitch+=filteredPitch;desiredRoll=filteredRoll;
-  state.supportDelta=support.left-support.right;
-  $('supportState').textContent=g.stance?`Left / right support: ${support.left.toFixed(1)} / ${support.right.toFixed(1)} mm · Δ ${state.supportDelta.toFixed(1)} mm`:'Swing · no ground feedback';
-  $('phaseName').textContent=g.label;$('phaseProgress').style.width=`${g.phase*100}%`;
- }else{desiredPitch=state.pitch;desiredRoll=state.roll;state.correctionPitch=desiredPitch;state.correctionRoll=desiredRoll;$('phaseName').textContent='MANUAL CONTROL';$('phaseProgress').style.width='0%';}
- const pose=feasiblePose(anchors,anklePivot.toArray(),desiredPitch,desiredRoll,+$('height').value,ankleLimits);
- state.correctionPitch=pose.pitch-basePitch;state.correctionRoll=pose.roll;state.kneeVelocity=state.running&&state.mode==='auto'&&dt>0?(knee-state.knee)/dt:0;state.hipVelocity=state.running&&state.mode==='auto'&&dt>0?(hip-state.hip)/dt:0;state.knee=knee;state.hip=hip;state.extensions=pose.extensions;state.limited=pose.limited;state.appliedPitch=pose.pitch;state.appliedRoll=pose.roll;state.height=pose.height;
+  // Smooth gait: belt-matched foot path + IK about the fixed hip mount (motion.js).
+  const amp=$('uneven').checked?+$('roughness').value:0,st=$('stones').checked?stones:[],sh=+$('stoneHeight').value;
+  const env={height:+$('height').value,surface:(x,z,d)=>surfaceHeight(x,z,d,amp,st,sh),support:$('adaptive').checked?(x,z,d)=>supportSlope(x,z,d,amp,st,sh):null};
+  rig.limits=ankleLimits;
+  gp=gaitPose(state.phase,state.distance,rig,env);
+  // Bridge-reported motor limits still bound the command (IK result is clamped, never extended).
+  hip=clamp(gp.hip,+$('hip').min,+$('hip').max);knee=clamp(gp.knee,+$('knee').min,+$('knee').max);basePitch=gp.basePitch;pose=gp.pose;
+  const rates=state.running&&dt>0?gaitRates(state.phase,state.distance,rig,env,+$('speed').value*(state.cadenceScale??1)):{hip:0,knee:0};
+  state.kneeVelocity=rates.knee;state.hipVelocity=rates.hip;
+  const sup=gp.support;state.supportDelta=sup?sup.left-sup.right:0;
+  $('supportState').textContent=gp.stance&&sup?`Left / right support: ${sup.left.toFixed(1)} / ${sup.right.toFixed(1)} mm · Δ ${state.supportDelta.toFixed(1)} mm · weight ${gp.weight.toFixed(2)}`:gp.stance?'Left / right support: adaptive off':`Swing · pre-shaping to landing (${gp.weight.toFixed(2)})`;
+  $('phaseName').textContent=gp.label;$('phaseProgress').style.width=`${gp.phase*100}%`;
+ }else{desiredPitch=state.pitch;desiredRoll=state.roll;state.correctionPitch=desiredPitch;state.correctionRoll=desiredRoll;$('phaseName').textContent='MANUAL CONTROL';$('phaseProgress').style.width='0%';
+  pose=feasiblePose(anchors,anklePivot.toArray(),desiredPitch,desiredRoll,+$('height').value,ankleLimits);state.kneeVelocity=0;state.hipVelocity=0;}
+ state.correctionPitch=pose.pitch-basePitch;state.correctionRoll=pose.roll;state.knee=knee;state.hip=hip;state.extensions=pose.extensions;state.limited=pose.limited;state.appliedPitch=pose.pitch;state.appliedRoll=pose.roll;state.height=pose.height;
  root.rotation.z=hip*rad;
- // Rotate the entire prosthesis about the hip, keeping the pelvis upright.
- const hipLocal=new THREE.Vector3(-22,395,0);
- root.position.set(kneePivot.x,kneePivot.y+baseGround,kneePivot.z).add(hipLocal).sub(hipLocal.clone().applyAxisAngle(new THREE.Vector3(0,0,1),hip*rad));
+ if(gp){// Knee pivot hangs from the fixed hip mount; no rig translation is used to fake contact.
+  const c=Math.cos(hip*rad),sn=Math.sin(hip*rad);root.position.set(rig.hipX-(c*HIP_LOCAL[0]-sn*HIP_LOCAL[1]),rig.hipY-(sn*HIP_LOCAL[0]+c*HIP_LOCAL[1]),kneePivot.z);
+ }else{// Manual: rotate the entire prosthesis about the hip, keeping the pelvis upright.
+  const hipLocal=new THREE.Vector3(...HIP_LOCAL,0);
+  root.position.set(kneePivot.x,kneePivot.y+baseGround,kneePivot.z).add(hipLocal).sub(hipLocal.clone().applyAxisAngle(new THREE.Vector3(0,0,1),hip*rad));
+ }
  shank.rotation.z=-knee*rad;
  foot.position.copy(anklePivot).sub(kneePivot);foot.position.y-=pose.height;
  foot.rotation.set(pose.roll*rad,0,pose.pitch*rad,'ZXY');
@@ -207,16 +213,6 @@ function solvePose(dt){
   a.piston.position.copy(local).sub(kneePivot);a.piston.quaternion.copy(q);
  }
  root.updateMatrixWorld(true);
- if(state.mode==='auto'){
-  // Geometric nonpenetration only: vertical mounting follows the lowest sole sample.
-  const g=gait(state.phase),s=clamp((g.phase-.62)/.38,0,1);
-  const targetX=g.stance?100-350*g.phase:-117+217*(s*s*(3-2*s));
-  const contactCenter=new THREE.Vector3(40-anklePivot.x,-85-anklePivot.y,-anklePivot.z).applyMatrix4(foot.matrixWorld);
-  root.position.x+=targetX-contactCenter.x;root.updateMatrixWorld(true);
-  const amp=$('uneven').checked?+$('roughness').value:0;let shift=-Infinity;
-  for(const v of contactVertices){const w=v.clone().applyMatrix4(foot.matrixWorld);shift=Math.max(shift,surfaceHeight(w.x,w.z,state.distance,amp,$('stones').checked?stones:[],+$('stoneHeight').value)-w.y);}
-  root.position.y+=shift+lift;root.updateMatrixWorld(true);
- }
  if(dummy)dummy.update(state,(x,z)=>surfaceHeight(x,z,state.distance,$('uneven').checked?+$('roughness').value:0,$('stones').checked?stones:[],+$('stoneHeight').value));
  $('hipV').textContent=`${hip.toFixed(1)}°`;$('kneeV').textContent=`${knee.toFixed(1)}°`;$('angles').textContent=`${pose.pitch.toFixed(1)}° / ${pose.roll.toFixed(1)}°`;
  if(state.mode==='auto'){$('knee').value=knee;$('hip').value=hip;}
@@ -234,7 +230,8 @@ function syncControls(){
 function reset(){
  if(bridgeToken)bridgeDisarm();
  Object.assign(state,{running:false,time:0,phase:0,distance:0,knee:0,kneeVelocity:0,pitch:0,roll:0,height:0,hip:0});$('hip').value=0;$('knee').value=0;$('height').value=0;$('heightV').textContent='0.0 mm';$('stick').style.transform='translate(0,0)';history.length=0;samples.length=0;lastSample=0;lastTerrain=-1;filteredPitch=0;filteredRoll=0;state.supportDelta=0;$('supportState').textContent='Left / right support: —';
- const m=state.mode;state.mode='manual';solvePose(0);state.mode=m;updateTerrain();drawChart();syncControls();$('simTime').textContent='00:00.0';
+ // Auto mode shows the heel-strike pose before Start.
+ state.cadenceScale=0;solvePose(0);updateTerrain();drawChart();syncControls();$('simTime').textContent='00:00.0';
 }
 function setJoystick(x,y){if(!state.running||state.mode!=='manual')return;const len=Math.hypot(x,y);if(len>1){x/=len;y/=len;}state.pitch=-y*18;state.roll=x*12;$('stick').style.transform=`translate(${x*43}px,${y*43}px)`;}
 function releaseJoy(){joyDrag=false;if(state.running&&state.mode==='manual')setJoystick(0,0);}
@@ -247,7 +244,8 @@ function drawChart(){
 }
 function animate(){
  requestAnimationFrame(animate);const dt=Math.min(clock.getDelta(),.05);
- if(state.ready&&state.running){state.time+=dt;if(state.mode==='auto'){const speed=+$('speed').value;state.distance+=speed*1000*dt;state.phase=(state.phase+speed/.35*dt)%1;}solvePose(dt);
+ if(state.ready&&state.running){state.time+=dt;if(state.mode==='auto'){// Soft start: cadence eases in over 1.5 s so joint speeds start from zero.
+   state.cadenceScale=smooth5((state.time-(state.startTime||0))/1.5);const speed=+$('speed').value*state.cadenceScale;state.distance+=speed*1000*dt;state.phase=(state.phase+speed*1000/GAIT.stride*dt)%1;}solvePose(dt);
   if(state.time-lastTerrain>1/30){updateTerrain();lastTerrain=state.time;}
   if(state.time-lastSample>=.05){lastSample=state.time;const row={time:state.time,pitch:state.correctionPitch,roll:state.correctionRoll,knee:state.knee,hip:state.hip,hipVelocity:state.hipVelocity,anklePitch:state.appliedPitch,ankleRoll:state.appliedRoll,height:state.height,supportDelta:state.supportDelta||0,a1:state.extensions[0]-20,a2:state.extensions[1]-20,a3:state.extensions[2]-20,limited:state.limited?1:0};history.push(row);samples.push(row);while(history.length&&history[0].time<state.time-10)history.shift();if(samples.length>72000)samples.shift();drawChart();}
   $('simTime').textContent=`${String(Math.floor(state.time/60)).padStart(2,'0')}:${(state.time%60).toFixed(1).padStart(4,'0')}`;
@@ -259,7 +257,7 @@ function events(){
  $('motorArm').onclick=async()=>{if(!bridgeToken||!state.ready||bridgeArmPending)return;const generation=bridgeGeneration;bridgeArmPending=true;$('motorArm').disabled=true;$('motorDisarm').disabled=false;try{await bridgePost('update',{angle_deg:state.knee,hip_angle_deg:state.hip,hip_velocity_deg_s:state.running&&state.mode==='auto'?state.hipVelocity:0,extensions_mm:[...state.extensions],velocity_deg_s:state.running&&state.mode==='auto'?state.kneeVelocity:0,running:state.running,mode:state.mode});if(generation===bridgeGeneration)await bridgePost('arm');}catch(e){$('motorStatus').textContent=`Motor: ${e.message}`;}finally{bridgeArmPending=false;$('motorArm').disabled=!bridgeToken||bridgeArmed;$('motorDisarm').disabled=!bridgeToken||!bridgeArmed;}};
  $('hipZero').onclick=async()=>{if(!bridgeToken||bridgeArmed||state.running)return;try{await bridgePost('update',{angle_deg:state.knee,hip_angle_deg:state.hip,running:false,mode:state.mode,extensions_mm:[...state.extensions]});await bridgePost('zero',{joint:'hip'});}catch(e){$('hipStatus').textContent=`Hip: ${e.message}`;}};
  $('motorDisarm').onclick=bridgeDisarm;
- $('start').onclick=()=>{state.running=true;clock.getDelta();syncControls();};$('stop').onclick=()=>{state.running=false;joyDrag=false;syncControls();};$('reset').onclick=reset;
+ $('start').onclick=()=>{state.running=true;state.startTime=state.time;clock.getDelta();syncControls();};$('stop').onclick=()=>{state.running=false;joyDrag=false;syncControls();};$('reset').onclick=reset;
  for(const mode of ['manual','auto'])$(mode).onclick=()=>{state.mode=mode;reset();};
  $('hip').oninput=()=>{$('hipV').textContent=`${(+$('hip').value).toFixed(1)}°`;};$('knee').oninput=()=>{$('kneeV').textContent=`${(+$('knee').value).toFixed(1)}°`;};$('height').oninput=()=>{$('heightV').textContent=`${(+$('height').value).toFixed(1)} mm`;};
  $('speed').oninput=()=>{$('speedV').textContent=`${(+$('speed').value).toFixed(2)} m/s`;$('slow').classList.toggle('selected',+$('speed').value<=.3);$('normal').classList.toggle('selected',+$('speed').value>.3);};
