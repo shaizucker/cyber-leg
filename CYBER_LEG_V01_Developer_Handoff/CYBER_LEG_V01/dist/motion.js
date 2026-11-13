@@ -42,24 +42,7 @@ export function supportSlope(x,z,distance,amplitude,stones=[],height=8){
  return {pitch:clamp(Math.atan((front-back)/95)/rad,-18,18),roll:clamp(-Math.atan((left-right)/44)/rad,-18,18),left,right};
 }
 // ---------------------------------------------------------------------------
-// Smooth gait generator.
-// Design rules: (1) every trajectory is C2-continuous around the whole cycle,
-// so commanded joint speed never jumps; (2) the ankle moves exactly with the
-// belt during stance and lands with belt speed and zero vertical speed;
-// (3) hip and knee come from inverse kinematics about a FIXED hip mount, so
-// the joint angles sent to the motors are the ones that produce the foot path.
-// Edit GAIT to tune. Angles in degrees, lengths in mm, phase 0 = heel strike.
-export const GAIT={
- stance:.62,          // stance fraction of the cycle
- stride:350,          // belt travel per cycle (mm); cadence = speed / stride
- hipLead:.55,         // share of the stance path in front of the hip
- clearance:38,        // extra ankle lift in swing (mm), peak near 43% of swing
- minKnee:4,           // knee flexion at the longest reach; keeps IK away from the straight-leg singularity
- // Foot angle to the ground, toes up positive: heel strike, foot flat, heel rise, push-off, swing.
- footPitch:[[0,4],[.07,0],[.36,0],[.50,-6],[.62,-24],[.70,-14],[.80,-3],[.92,3]],
- // Terrain adaptation weight: fades out over heel rise, fades in over late swing.
- adaptFade:[.44,.60],adaptIn:.55
-};
+// Shared curve helpers. The gait and activity generator lives in gait.js.
 export const smooth5=t=>{t=clamp(t,0,1);return t*t*t*(10+t*(6*t-15));};
 // Periodic C2 cubic spline through [phase, value] keys (period 1). Returns p => [value, d/dphase].
 export function periodicSpline(keys){
@@ -79,84 +62,6 @@ export function periodicSpline(keys){
   const d=(y[j]-y[i])/hi+((1-3*a*a)*M[i]+(3*b*b-1)*M[j])*hi/6;
   return [v,d];
  };
-}
-// Quintic Hermite: position, velocity and acceleration matched at both ends.
-function quintic(p0,v0,a0,p1,v1,a1,s){
- const s2=s*s,s3=s2*s,s4=s3*s,s5=s4*s;
- return p0*(1-10*s3+15*s4-6*s5)+v0*(s-6*s3+8*s4-3*s5)+a0*(.5*s2-1.5*s3+1.5*s4-.5*s5)
-  +a1*(.5*s3-s4+.5*s5)+v1*(-4*s3+7*s4-3*s5)+p1*(10*s3-15*s4+6*s5);
-}
-const LIFT_PEAK=(3/7)**3*(4/7)**4;
-let pitchSpline=null,pitchKeys=null;
-export function footPitchAt(phase){if(pitchKeys!==GAIT.footPitch){pitchKeys=GAIT.footPitch;pitchSpline=periodicSpline(pitchKeys);}return pitchSpline(phase)[0];}
-// Ankle path relative to the hip mount (x forward). No vertical terms besides swing lift.
-export function footPath(phase){
- const p=((phase%1)+1)%1,{stance,stride,hipLead,clearance}=GAIT,Ls=stance*stride,xHS=hipLead*Ls,xTO=xHS-Ls;
- if(p<stance)return {x:xHS-stride*p,lift:0,stance:true,s:p/stance,phase:p};
- const s=(p-stance)/(1-stance),v=-stride*(1-stance);
- return {x:quintic(xTO,v,0,xHS,v,0,s),lift:clearance*s*s*s*(1-s)**4/LIFT_PEAK,stance:false,s,phase:p};
-}
-export function gaitLabel(p){const{stance}=GAIT;return p<.07?'HEEL CONTACT':p<.45?'STANCE':p<stance?'PUSH-OFF':'SWING';}
-function adaptWeight(p){const{stance,adaptFade,adaptIn}=GAIT;
- if(p<stance)return 1-smooth5((p-adaptFade[0])/(adaptFade[1]-adaptFade[0]));
- return smooth5(((p-stance)/(1-stance)-adaptIn)/(1-adaptIn));}
-// Ankle height that puts the sole on the surface (foot orientation is world pitch/roll).
-// A soft maximum (1 mm temperature) replaces the hard max so the heel-to-flat-to-toe
-// hand-over has no kink; it sits at most ~1 mm x ln(samples) above the hard contact.
-export function contactHeight(contact,pitch,roll,ax,az,surface,T=1){
- const ys=contact.map(v=>{const r=rotateFoot(v,pitch,roll);return surface(ax+r[0],az+r[2])-r[1];});
- const m=Math.max(...ys);let s=0;for(const y of ys)s+=Math.exp((y-m)/T);return m+T*Math.log(s)-T*Math.log(ys.length);
-}
-// Planar two-link IK. u = knee->hip in the thigh frame, w = knee->ankle in the shank frame.
-export function legLength(u,w,knee){const c=Math.cos(knee*rad),s=Math.sin(knee*rad);return Math.hypot(c*w[0]+s*w[1]-u[0],-s*w[0]+c*w[1]-u[1]);}
-export function solveLeg(dx,dy,u,w,maxKnee=105){
- const Lu=Math.hypot(u[0],u[1]),Lw=Math.hypot(w[0],w[1]),D=Math.hypot(dx,dy);
- const c=clamp((Lu*Lu+Lw*Lw-D*D)/(2*Lu*Lw),-1,1);
- let beta=Math.atan2(w[1],w[0])-Math.atan2(u[1],u[0]);beta=((beta%(2*Math.PI))+2*Math.PI)%(2*Math.PI);
- const raw=(beta-Math.acos(c))/rad,knee=clamp(raw,0,maxKnee);
- const cs=Math.cos(knee*rad),sn=Math.sin(knee*rad),vx=cs*w[0]+sn*w[1]-u[0],vy=-sn*w[0]+cs*w[1]-u[1];
- return {hip:(Math.atan2(dy,dx)-Math.atan2(vy,vx))/rad,knee,reach:raw<0||raw>maxKnee};
-}
-// Fixed hip height: the longest reach in the flat-ground cycle gets exactly minKnee.
-export function hipHeight(rig){
- const L=legLength(rig.u,rig.w,GAIT.minKnee),flat=()=>0;let H=Infinity;
- for(let i=0;i<400;i++){const p=i/400,f=footPath(p),y=contactHeight(rig.contact,footPitchAt(p),0,0,0,flat)+f.lift;
-  if(Math.abs(f.x)<L)H=Math.min(H,y+Math.sqrt(L*L-f.x*f.x));}
- return H;
-}
-/* Full pose for one phase. Pure function of (phase, belt distance at that phase).
- rig: {u,w,contact,anchors,pivot,limits,hipX,hipY,z}
- env: {surface(x,z,distance), support(x,z,distance) -> {pitch,roll}|null, height} */
-export function gaitPose(phase,distance,rig,env){
- const p=((phase%1)+1)%1,{stance,stride}=GAIT,f=footPath(p),flat=()=>0;
- const surf=d=>(x,z)=>env.surface(x,z,d);
- // Terrain under a future/past stance foot is fixed to the belt, so it can be looked up exactly.
- const landD=distance+(1-p)*stride,toD=distance-(p-stance)*stride;
- const sup=env.support?env.support(rig.hipX+f.x+40,rig.z,p<stance?distance:landD):null,w=adaptWeight(p);
- let pitch=footPitchAt(p)+(sup?w*sup.pitch:0),roll=sup?w*sup.roll:0;
- const ax=rig.hipX+f.x;
- const ankleY=(pt,rl)=>{
-  if(p<stance)return contactHeight(rig.contact,pt,rl,ax,rig.z,surf(distance));
-  // Swing: blend the terrain offset from toe-off to the predicted landing.
-  const p0=footPitchAt(0),pTO=footPitchAt(stance),sL=env.support?env.support(rig.hipX+footPath(0).x+40,rig.z,landD):null;
-  const gTO=contactHeight(rig.contact,pTO,0,rig.hipX+footPath(stance).x,rig.z,surf(toD))-contactHeight(rig.contact,pTO,0,0,0,flat);
-  const pL=p0+(sL?sL.pitch:0),rL=sL?sL.roll:0,xL=rig.hipX+footPath(0).x;
-  const gL=contactHeight(rig.contact,pL,rL,xL,rig.z,surf(landD))-contactHeight(rig.contact,pL,rL,0,0,flat);
-  return contactHeight(rig.contact,pt,rl,0,0,flat)+f.lift+gTO+(gL-gTO)*smooth5(f.s);
- };
- const w0=[rig.w[0],rig.w[1]-(env.height||0)];
- let ay=ankleY(pitch,roll),leg=solveLeg(ax-rig.hipX,ay-rig.hipY,rig.u,w0);
- let rel=pitch-(leg.hip-leg.knee),pose=feasiblePose(rig.anchors,rig.pivot,rel,roll,env.height||0,rig.limits);
- if(pose.limited){// Re-seat the foot with the orientation the ankle can actually reach.
-  pitch=pose.pitch+(leg.hip-leg.knee);roll=pose.roll;ay=ankleY(pitch,roll);leg=solveLeg(ax-rig.hipX,ay-rig.hipY,rig.u,w0);
-  pose=feasiblePose(rig.anchors,rig.pivot,pitch-(leg.hip-leg.knee),roll,env.height||0,rig.limits);}
- return {phase:p,stance:p<stance,label:gaitLabel(p),hip:leg.hip,knee:leg.knee,reach:leg.reach,footPitch:pitch,basePitch:footPitchAt(p)-(leg.hip-leg.knee),
-  pose,ankle:[ax,ay],support:sup,weight:w};
-}
-// Joint speeds (deg/s) by central difference of the pure pose function.
-export function gaitRates(phase,distance,rig,env,speed){
- const h=1e-3,r=speed*1000/GAIT.stride,a=gaitPose(phase+h,distance+h*GAIT.stride,rig,env),b=gaitPose(phase-h,distance-h*GAIT.stride,rig,env);
- return {hip:(a.hip-b.hip)/(2*h)*r,knee:(a.knee-b.knee)/(2*h)*r};
 }
 // Rotation matches THREE Euler(roll, 0, pitch, 'ZXY'): Rz * Rx.
 export function rotateFoot(v,pitch,roll){

@@ -1,9 +1,11 @@
 import {installMotorConsole} from './motor-console.js';
 import {WalkingDummy} from './dummy.js';
 import * as THREE from './three.module.min.js';
-import {rad,clamp,terrain,makeStones,wrapStone,stoneProfile,surfaceHeight,supportSlope,feasiblePose,GAIT,gaitPose,gaitRates,hipHeight,smooth5} from './motion.js';
+import {rad,clamp,terrain,makeStones,wrapStone,stoneProfile,surfaceHeight,supportSlope,feasiblePose} from './motion.js';
+import {GaitEngine,ACTIVITY_LABELS} from './gait.js';
+import {EnergyMeter,DEVICES} from './energy.js';
 const $=id=>document.getElementById(id);
-const state={ready:false,running:false,mode:'manual',time:0,phase:0,distance:0,knee:0,kneeVelocity:0,pitch:0,roll:0,height:0,hip:0,hipVelocity:0,correctionPitch:0,correctionRoll:0,extensions:[20,20,20],limited:false};
+const state={activity:'walk',stairsDir:'stairsUp',chart:'ankle',targetHip:0,targetKnee:0,actualHip:null,actualKnee:null,clamped:false,ready:false,running:false,mode:'manual',time:0,phase:0,distance:0,knee:0,kneeVelocity:0,pitch:0,roll:0,height:0,hip:0,hipVelocity:0,correctionPitch:0,correctionRoll:0,extensions:[20,20,20],limited:false};
 let dummy;
 let scene,camera,renderer,root,shank,foot,cad,meshes=[],actuators=[],anchors=[],contactVertices=[],axisGroup,terrainMesh;
 let kneePivot=new THREE.Vector3(-7.4,387.77,.831),anklePivot=new THREE.Vector3(.435,-16.962,.831);
@@ -12,8 +14,11 @@ const history=[],samples=[];let lastSample=0,lastTerrain=-1,baseGround=94.582;
 const orbit={theta:1.05,phi:1.27,radius:2750,target:new THREE.Vector3(25,820,-60)};
 const clock=new THREE.Clock();let drag=null,joyDrag=false,pointerDown=null;
 let ankleLimits=null;
-// Gait rig: fixed hip mount (world mm). u = knee->hip in the thigh frame (matches dummy.js hipLocal).
-const HIP_LOCAL=[-22,395];let rig=null;
+// Gait rig. u = knee->hip in the thigh frame (matches dummy.js hipLocal). The
+// activity engine (gait.js) moves the pelvis; the joint angles are what the motors receive.
+const HIP_LOCAL=[-22,395];let rig=null,engine=null,gp=null;
+const energy=new EnergyMeter(),jointHistory=[];
+let treadmillParts=[],floorMesh,stairGroup,stairMeshes=[],chairGroup,obstacleMeshes=[],lastStats=-1;
 let bridgeToken=null,bridgeBusy=false,bridgeArmed=false,bridgeArmPending=false,bridgeGeneration=0,bridgeQueue=Promise.resolve();
 function applyMotorLimits(data){
  const rotary=data.console?.rotary;if(!rotary)return;
@@ -33,6 +38,8 @@ const onlineConsole=installMotorConsole({post:bridgePost,onLimits(data){applyMot
 }});
 function bridgeDisplay(data){
  applyMotorLimits(data);onlineConsole.render({...data,simulator_running:state.running});
+ const rot=data.console?.rotary;state.actualKnee=rot?.knee?.stale===false?rot.knee.actual_angle_deg:null;state.actualHip=rot?.hip?.stale===false?rot.hip.actual_angle_deg:null;
+ energy.ingest(data.console,performance.now()/1000);
  const ankle=data.ankle;
  ankleLimits=ankle?.enabled?(ankle.limits_mm||[[0,39],[0,39],[0,39]]):null;
  $('ankleStatus').textContent=!ankle?.enabled?'Ankle control disabled':ankle.error?`Ankle: ${ankle.error}`:ankle.arming?'Ankle connecting and checking nodes 1/2/3...':ankle.armed?'Ankle armed: A1/A2/A3 = nodes 1/2/3':'Ankle disarmed';
@@ -124,7 +131,8 @@ function buildRig(){
  // Keep a distributed sole sample for interactive ground clearance checks.
  const cells=new Map();for(const v of contactVertices){const key=`${Math.round(v.x/5)},${Math.round(v.z/5)}`;if(!cells.has(key)||cells.get(key).y>v.y)cells.set(key,v);}
  contactVertices=[...cells.values()];
- rig={u:HIP_LOCAL,w:[anklePivot.x-kneePivot.x,anklePivot.y-kneePivot.y],contact:contactVertices.map(v=>v.toArray()),anchors,pivot:anklePivot.toArray(),limits:null,hipX:kneePivot.x+HIP_LOCAL[0],z:anklePivot.z};rig.hipY=hipHeight(rig);
+ rig={u:HIP_LOCAL,w:[anklePivot.x-kneePivot.x,anklePivot.y-kneePivot.y],contact:contactVertices.map(v=>v.toArray()),anchors,pivot:anklePivot.toArray(),limits:null,z:anklePivot.z,key:`${kneePivot.y}|${anklePivot.y}`};
+ engine=new GaitEngine(rig);applyGaitParams(false);
  axisGroup=new THREE.Group();root.add(axisGroup);
  // Same rotary motor type as the knee; illustrative housing at the hip.
  const hipMotor=new THREE.Mesh(new THREE.CylinderGeometry(48,48,65,32),new THREE.MeshStandardMaterial({color:0x52c8bd,metalness:.65,roughness:.3}));
@@ -134,7 +142,7 @@ function buildRig(){
  const ankleAxes=new THREE.AxesHelper(65);ankleAxes.position.copy(anklePivot).sub(kneePivot);axisGroup.add(ankleAxes);
  axisGroup.visible=$('joints').checked;
  $('kp').value=kneePivot.y.toFixed(2);$('ap').value=anklePivot.y.toFixed(3);
- dummy=new WalkingDummy(scene,root,kneePivot);dummy.setOpacity(+$('dummyOpacity').value/100);dummy.setVisible($('dummy').checked);
+ dummy=new WalkingDummy(scene,root,kneePivot,{upper:Math.hypot(...HIP_LOCAL),lower:Math.hypot(...rig.w),contact:rig.contact});dummy.setOpacity(+$('dummyOpacity').value/100);dummy.setVisible($('dummy').checked);
  reset();
 }
 function fitView(){const show=$('dummy').checked;orbit.radius=show?2750:1050;orbit.target.set(25,show?820:290,show?-60:0);cameraUpdate();}
@@ -147,10 +155,11 @@ function initScene(){
  renderer.setPixelRatio(Math.min(devicePixelRatio||1,1.75));renderer.setClearColor(0x131b22,0);renderer.outputColorSpace=THREE.SRGBColorSpace;renderer.toneMapping=THREE.ACESFilmicToneMapping;renderer.toneMappingExposure=1.55;
  scene.add(new THREE.HemisphereLight(0xddeeff,0x34322e,2.4));
  for(const [pos,intensity] of [[[200,800,500],3], [[-400,450,-350],2],[[500,200,-100],1]]){const l=new THREE.DirectionalLight(0xffffff,intensity);l.position.set(...pos);scene.add(l);}
- const deck=new THREE.Mesh(new THREE.BoxGeometry(1160,34,485),new THREE.MeshStandardMaterial({color:0x303c46,metalness:.5,roughness:.6}));deck.position.set(0,-26,0);scene.add(deck);
- for(const z of [-253,253]){const rail=new THREE.Mesh(new THREE.BoxGeometry(1180,35,20),new THREE.MeshStandardMaterial({color:0x77838c,metalness:.7,roughness:.4}));rail.position.set(0,-20,z);scene.add(rail);}
+ const deck=new THREE.Mesh(new THREE.BoxGeometry(1160,34,485),new THREE.MeshStandardMaterial({color:0x303c46,metalness:.5,roughness:.6}));deck.position.set(0,-26,0);scene.add(deck);treadmillParts.push(deck);
+ for(const z of [-253,253]){const rail=new THREE.Mesh(new THREE.BoxGeometry(1180,35,20),new THREE.MeshStandardMaterial({color:0x77838c,metalness:.7,roughness:.4}));rail.position.set(0,-20,z);scene.add(rail);treadmillParts.push(rail);}
+ buildProps();
  const geo=new THREE.PlaneGeometry(1140,464,180,52);geo.rotateX(-Math.PI/2);
- terrainMesh=new THREE.Mesh(geo,new THREE.MeshStandardMaterial({color:0x394952,roughness:.96,metalness:.1,side:THREE.DoubleSide,vertexColors:true}));scene.add(terrainMesh);
+ terrainMesh=new THREE.Mesh(geo,new THREE.MeshStandardMaterial({color:0x394952,roughness:.96,metalness:.1,side:THREE.DoubleSide,vertexColors:true}));scene.add(terrainMesh);treadmillParts.push(terrainMesh);
  const colors=new Float32Array(geo.attributes.position.count*3);geo.setAttribute('color',new THREE.BufferAttribute(colors,3));
  const grid=new THREE.GridHelper(2600,26,0x3c4952,0x29353e);grid.position.y=-45;scene.add(grid);
  buildStones();cameraUpdate();new ResizeObserver(resize).observe($('viewport'));resize();
@@ -169,41 +178,96 @@ function buildStones(){
 }
 function updateStones(){
  const amp=$('uneven').checked?+$('roughness').value:0;
- stoneMeshes.forEach((mesh,i)=>{const s=stones[i],x=wrapStone(s.x-state.distance);mesh.visible=$('stones').checked&&Math.abs(x)<535;mesh.position.set(x,terrain(x,s.z,state.distance,amp),s.z);mesh.scale.set(s.rx,s.height*+$('stoneHeight').value,s.rz);});
+ stoneMeshes.forEach((mesh,i)=>{const s=stones[i],x=wrapStone(s.x-state.distance);mesh.visible=$('stones').checked&&Math.abs(x)<535&&(state.mode==='manual'||state.activity==='walk');mesh.position.set(x,terrain(x,s.z,state.distance,amp),s.z);mesh.scale.set(s.rx,s.height*+$('stoneHeight').value,s.rz);});
 }
 function updateTerrain(){
  const amp=$('uneven').checked?+$('roughness').value:0,geo=terrainMesh.geometry,v=geo.attributes.position,c=geo.attributes.color;
  for(let i=0;i<v.count;i++){const x=v.getX(i),z=v.getZ(i);v.setY(i,terrain(x,z,state.distance,amp));const stripe=Math.floor((x+state.distance)/32)%2===0?.79:1; c.setXYZ(i,stripe,stripe,stripe);}
  v.needsUpdate=true;c.needsUpdate=true;geo.computeVertexNormals();updateStones();
 }
+// Scene props for the activities: floor, moving staircase, chair, trip obstacles.
+function buildProps(){
+ floorMesh=new THREE.Mesh(new THREE.BoxGeometry(1600,30,900),new THREE.MeshStandardMaterial({color:0x2e3a43,roughness:.9,metalness:.1}));floorMesh.position.set(0,-15,0);floorMesh.visible=false;scene.add(floorMesh);
+ stairGroup=new THREE.Group();scene.add(stairGroup);
+ const stairMat=new THREE.MeshStandardMaterial({color:0x56646e,roughness:.85,metalness:.15}),noseMat=new THREE.MeshStandardMaterial({color:0xff903d,roughness:.5,metalness:.2});
+ for(let i=0;i<30;i++){const step=new THREE.Mesh(new THREE.BoxGeometry(1,1,1),stairMat),nose=new THREE.Mesh(new THREE.BoxGeometry(1,1,1),noseMat);stairGroup.add(step,nose);stairMeshes.push({step,nose});}
+ chairGroup=new THREE.Group();scene.add(chairGroup);chairGroup.visible=false;
+ const wood=new THREE.MeshStandardMaterial({color:0x8a6a4c,roughness:.7,metalness:.05}),frame=new THREE.MeshStandardMaterial({color:0x55616a,roughness:.5,metalness:.6});
+ const seat=new THREE.Mesh(new THREE.BoxGeometry(430,28,520),wood);seat.position.set(-40,-14,-85);chairGroup.add(seat);
+ const back=new THREE.Mesh(new THREE.BoxGeometry(26,420,520),wood);back.position.set(-255,210,-85);chairGroup.add(back);
+ for(const x of [-235,155])for(const z of [-325,155]){const leg=new THREE.Mesh(new THREE.CylinderGeometry(13,13,1,12),frame);leg.userData.leg=true;leg.position.set(x,0,z);chairGroup.add(leg);}
+ const obstacleMat=new THREE.MeshStandardMaterial({color:0xff5f57,roughness:.6,metalness:.1});
+ for(let i=0;i<4;i++){const m=new THREE.Mesh(new THREE.BoxGeometry(26,34,180),obstacleMat);m.visible=false;scene.add(m);obstacleMeshes.push(m);}
+}
+function updateProps(p){
+ const walk=state.mode==='manual'||state.activity==='walk';
+ for(const m of treadmillParts)m.visible=walk;
+ if(!walk)for(const m of stoneMeshes)m.visible=false;
+ floorMesh.visible=state.mode==='auto'&&state.activity==='sit';
+ stairGroup.visible=!!p?.stairs;
+ if(p?.stairs){
+  const t=p.stairs.treads,up=p.stairs.rise>0;
+  stairMeshes.forEach(({step,nose},i)=>{
+   const tr=t[i];step.visible=nose.visible=!!tr&&tr.x1>-1200&&tr.x0<1200;if(!step.visible)return;
+   const depth=900,w=tr.x1-tr.x0;
+   step.scale.set(w,depth,620);step.position.set((tr.x0+tr.x1)/2,tr.y-depth/2,0);
+   nose.scale.set(16,6,622);nose.position.set(up?tr.x0+8:tr.x1-8,tr.y-2,0);
+  });
+ }
+ chairGroup.visible=!!p?.chair;
+ if(p?.chair){chairGroup.position.set(p.chair.seatX,p.chair.seatY,0);for(const c of chairGroup.children)if(c.userData.leg){c.scale.y=Math.max(10,p.chair.seatY-28);c.position.y=-28-c.scale.y/2;}}
+ obstacleMeshes.forEach((m,i)=>{const o=p?.obstacles?.[i];m.visible=!!o&&walk&&Math.abs(o.x)<560;if(m.visible){const amp=$('uneven').checked?+$('roughness').value:0;m.position.set(o.x,terrain(o.x,o.z,state.distance,amp)+17,o.z);}});
+}
+function surfaceEnv(){
+ const amp=$('uneven').checked?+$('roughness').value:0,st=$('stones').checked?stones:[],sh=+$('stoneHeight').value;
+ return {surface:(x,z,d)=>surfaceHeight(x,z,d,amp,st,sh),support:$('adaptive').checked?(x,z,d)=>supportSlope(x,z,d,amp,st,sh):null};
+}
+function applyGaitParams(resetIfNeeded=true){
+ if(!engine)return;
+ const old={...engine.params};
+ Object.assign(engine.params,{clearance:+$('clearance').value,pushOff:+$('pushOff').value/100,stanceKnee:+$('stanceKnee').value/100,
+  stairCadence:+$('stairCadence').value,sitHold:+$('sitHold').value,autoStumble:$('autoTrip').checked});
+ // Stair treads are laid out from the joint profiles; a profile change needs a fresh layout.
+ if(resetIfNeeded&&state.mode==='auto'&&state.activity.startsWith('stairs')&&old.clearance!==engine.params.clearance){const running=state.running;engine.reset(state.activity);if(running)engine.startTime=0;}
+}
 function solvePose(dt){
- let basePitch=0,desiredPitch=0,desiredRoll=0,hip=+$('hip').value,knee=+$('knee').value,lift=0;
- state.correctionPitch=0;state.correctionRoll=0;
- let pose,gp=null;
+ let hip=+$('hip').value,knee=+$('knee').value,pose;
+ state.correctionPitch=0;state.correctionRoll=0;gp=null;
  if(state.mode==='auto'){
-  // Smooth gait: belt-matched foot path + IK about the fixed hip mount (motion.js).
-  const amp=$('uneven').checked?+$('roughness').value:0,st=$('stones').checked?stones:[],sh=+$('stoneHeight').value;
-  const env={height:+$('height').value,surface:(x,z,d)=>surfaceHeight(x,z,d,amp,st,sh),support:$('adaptive').checked?(x,z,d)=>supportSlope(x,z,d,amp,st,sh):null};
+  const s=surfaceEnv(),walk=state.activity==='walk';
   rig.limits=ankleLimits;
-  gp=gaitPose(state.phase,state.distance,rig,env);
-  // Bridge-reported motor limits still bound the command (IK result is clamped, never extended).
-  hip=clamp(gp.hip,+$('hip').min,+$('hip').max);knee=clamp(gp.knee,+$('knee').min,+$('knee').max);basePitch=gp.basePitch;pose=gp.pose;
-  const rates=state.running&&dt>0?gaitRates(state.phase,state.distance,rig,env,+$('speed').value*(state.cadenceScale??1)):{hip:0,knee:0};
-  state.kneeVelocity=rates.knee;state.hipVelocity=rates.hip;
+  gp=engine.step(dt,{running:state.running,speed:+$('speed').value,surface:walk?s.surface:null,support:walk?s.support:null,
+   height:+$('height').value,ankleLimits,fixedMount:$('fixedMount').checked});
+  state.phase=gp.phase;state.distance=gp.groundX;
+  state.targetHip=gp.target.hip;state.targetKnee=gp.target.knee;
+  // Bridge-reported motor limits bound the command. The model shows the target pose.
+  hip=clamp(gp.target.hip,+$('hip').min,+$('hip').max);knee=clamp(gp.target.knee,+$('knee').min,+$('knee').max);
+  const hipClamped=Math.abs(hip-gp.target.hip)>.05,kneeClamped=Math.abs(knee-gp.target.knee)>.05;
+  state.clamped=hipClamped||kneeClamped;
+  // A clamped joint is held at its limit: no velocity feed-forward into the stop.
+  state.kneeVelocity=state.running&&!kneeClamped?gp.rates.knee:0;state.hipVelocity=state.running&&!hipClamped?gp.rates.hip:0;
+  pose={pitch:gp.our.ankle,roll:gp.our.roll,height:gp.our.height,extensions:gp.our.extensions,limited:gp.our.limited};
+  state.correctionPitch=pose.pitch-gp.nominalAnkle;state.correctionRoll=pose.roll;
   const sup=gp.support;state.supportDelta=sup?sup.left-sup.right:0;
-  $('supportState').textContent=gp.stance&&sup?`Left / right support: ${sup.left.toFixed(1)} / ${sup.right.toFixed(1)} mm · Δ ${state.supportDelta.toFixed(1)} mm · weight ${gp.weight.toFixed(2)}`:gp.stance?'Left / right support: adaptive off':`Swing · pre-shaping to landing (${gp.weight.toFixed(2)})`;
-  $('phaseName').textContent=gp.label;$('phaseProgress').style.width=`${gp.phase*100}%`;
- }else{desiredPitch=state.pitch;desiredRoll=state.roll;state.correctionPitch=desiredPitch;state.correctionRoll=desiredRoll;$('phaseName').textContent='MANUAL CONTROL';$('phaseProgress').style.width='0%';
-  pose=feasiblePose(anchors,anklePivot.toArray(),desiredPitch,desiredRoll,+$('height').value,ankleLimits);state.kneeVelocity=0;state.hipVelocity=0;}
- state.correctionPitch=pose.pitch-basePitch;state.correctionRoll=pose.roll;state.knee=knee;state.hip=hip;state.extensions=pose.extensions;state.limited=pose.limited;state.appliedPitch=pose.pitch;state.appliedRoll=pose.roll;state.height=pose.height;
- root.rotation.z=hip*rad;
- if(gp){// Knee pivot hangs from the fixed hip mount; no rig translation is used to fake contact.
-  const c=Math.cos(hip*rad),sn=Math.sin(hip*rad);root.position.set(rig.hipX-(c*HIP_LOCAL[0]-sn*HIP_LOCAL[1]),rig.hipY-(sn*HIP_LOCAL[0]+c*HIP_LOCAL[1]),kneePivot.z);
+  if(walk)$('supportState').textContent=gp.stance&&sup?`Left / right support: ${sup.left.toFixed(1)} / ${sup.right.toFixed(1)} mm · Δ ${state.supportDelta.toFixed(1)} mm · weight ${gp.adaptWeight.toFixed(2)}`:gp.stance?'Left / right support: adaptive off':`Swing · pre-shaping to landing (${gp.adaptWeight.toFixed(2)})`;
+  $('phaseName').textContent=gp.label;$('phaseProgress').style.width=`${gp.progress*100}%`;
+  const badge=$('clampBadge');badge.hidden=!state.clamped;
+  if(state.clamped)badge.textContent=`MOTOR LIMIT · ${hipClamped?`hip ${gp.target.hip.toFixed(0)}° → ${hip.toFixed(0)}°`:''}${hipClamped&&kneeClamped?' · ':''}${kneeClamped?`knee ${gp.target.knee.toFixed(0)}° → ${knee.toFixed(0)}°`:''}`;
+ }else{
+  state.correctionPitch=state.pitch;state.correctionRoll=state.roll;$('phaseName').textContent='MANUAL CONTROL';$('phaseProgress').style.width='0%';$('clampBadge').hidden=true;state.clamped=false;
+  pose=feasiblePose(anchors,anklePivot.toArray(),state.pitch,state.roll,+$('height').value,ankleLimits);state.kneeVelocity=0;state.hipVelocity=0;
+  state.targetHip=hip;state.targetKnee=knee;
+ }
+ state.knee=knee;state.hip=hip;state.extensions=pose.extensions;state.limited=pose.limited;state.appliedPitch=pose.pitch;state.appliedRoll=pose.roll;state.height=pose.height;
+ const showHip=gp?gp.target.hip:hip,showKnee=gp?gp.target.knee:knee;
+ root.rotation.z=showHip*rad;
+ if(gp){// The pelvis (hip joint) comes from the activity engine; the knee pivot hangs from it.
+  const c=Math.cos(showHip*rad),sn=Math.sin(showHip*rad);root.position.set(gp.pelvis[0]-(c*HIP_LOCAL[0]-sn*HIP_LOCAL[1]),gp.pelvis[1]-(sn*HIP_LOCAL[0]+c*HIP_LOCAL[1]),kneePivot.z);
  }else{// Manual: rotate the entire prosthesis about the hip, keeping the pelvis upright.
   const hipLocal=new THREE.Vector3(...HIP_LOCAL,0);
   root.position.set(kneePivot.x,kneePivot.y+baseGround,kneePivot.z).add(hipLocal).sub(hipLocal.clone().applyAxisAngle(new THREE.Vector3(0,0,1),hip*rad));
  }
- shank.rotation.z=-knee*rad;
+ shank.rotation.z=-showKnee*rad;
  foot.position.copy(anklePivot).sub(kneePivot);foot.position.y-=pose.height;
  foot.rotation.set(pose.roll*rad,0,pose.pitch*rad,'ZXY');
  for(const a of actuators){
@@ -213,43 +277,127 @@ function solvePose(dt){
   a.piston.position.copy(local).sub(kneePivot);a.piston.quaternion.copy(q);
  }
  root.updateMatrixWorld(true);
- if(dummy)dummy.update(state,(x,z)=>surfaceHeight(x,z,state.distance,$('uneven').checked?+$('roughness').value:0,$('stones').checked?stones:[],+$('stoneHeight').value));
+ updateProps(gp);
+ const heightAt=state.mode==='manual'||state.activity==='walk'?(x,z)=>surfaceHeight(x,z,state.distance,$('uneven').checked?+$('roughness').value:0,$('stones').checked?stones:[],+$('stoneHeight').value):()=>0;
+ if(dummy)dummy.update(state,gp?{soundAnkle:gp.sound.ankleWorld,soundPitch:gp.sound.footPitch,trunk:gp.trunk,swing:state.activity!=='sit',phase:gp.phase}:{heightAt});
  $('hipV').textContent=`${hip.toFixed(1)}°`;$('kneeV').textContent=`${knee.toFixed(1)}°`;$('angles').textContent=`${pose.pitch.toFixed(1)}° / ${pose.roll.toFixed(1)}°`;
  if(state.mode==='auto'){$('knee').value=knee;$('hip').value=hip;}
  pose.extensions.forEach((e,i)=>{$(`bar${i}`).style.left=`${clamp(Math.min(20,e)/50,0,1)*100}%`;$(`bar${i}`).style.width=`${clamp(Math.abs(e-20)/50,0,1)*100}%`;$(`ext${i}`).textContent=(e-20).toFixed(1);});
  $('limitState').textContent=pose.limited?'Travel limit reached · command reduced':'Within assumed 0–50 mm travel';$('limitState').classList.toggle('warn',pose.limited);
 }
+function updateStats(){
+ if(!gp)return;
+ if(state.activity==='walk'){const D=gp.stride.x;$('gaitStats').textContent=`Stride ${D.toFixed(0)} mm · ${gp.cadence.toFixed(0)} strides/min · ${engine.stumbles} trips`;}
+ else if(gp.stairs)$('stairStats').textContent=`Step ${Math.abs(gp.stairs.rise).toFixed(0)} mm rise × ${gp.stairs.run.toFixed(0)} mm run · ${(gp.cadence*2).toFixed(0)} steps/min`;
+ else if(gp.chair)$('sitStats').textContent=`${gp.label.toLowerCase()} · seat ${(gp.chair.seatY).toFixed(0)} mm above floor · ${engine.cycles} cycles`;
+ const trip=engine.lastTrip;
+ if(trip&&state.time-trip.time<2.5){$('tripState').textContent=trip.type==='elevating'?'Trip in early swing → elevating: knee and hip flex to lift the foot over.':'Trip in late swing → lowering: foot placed early with a shorter step.';$('tripState').classList.add('event');}
+ else if($('tripState').classList.contains('event')){$('tripState').textContent='Early swing → elevating strategy (lift the foot over). Late swing → lowering strategy (short, early step).';$('tripState').classList.remove('event');}
+ const note=$('clampState');note.hidden=!state.clamped;
+ if(state.clamped)note.textContent=`This activity needs hip ${state.targetHip.toFixed(0)}° / knee ${state.targetKnee.toFixed(0)}°. Motor commands are clamped at the configured limits (hip ${$('hip').min}…${$('hip').max}°, knee ${$('knee').min}…${$('knee').max}°); the model shows the full target.`;
+}
 function syncControls(){
  onlineConsole.setRunning(state.running);
- $('runState').textContent=state.running?(state.mode==='auto'?'AUTO / RUNNING':'MANUAL / ACTIVE'):'STOPPED';$('runState').classList.toggle('running',state.running);
+ const label=state.mode==='auto'?(ACTIVITY_LABELS[state.activity]||'AUTO').toUpperCase():'MANUAL';
+ $('runState').textContent=state.running?`${label} / RUNNING`:'STOPPED';$('runState').classList.toggle('running',state.running);
  $('start').disabled=!state.ready||state.running;$('stop').disabled=!state.ready||!state.running;$('reset').disabled=!state.ready;
  $('hip').disabled=!state.running||state.mode==='auto';$('knee').disabled=!state.running||state.mode==='auto';$('height').disabled=!state.running;$('joy').classList.toggle('disabled',!state.running||state.mode!=='manual');
- $('manual').classList.toggle('selected',state.mode==='manual');$('auto').classList.toggle('selected',state.mode==='auto');
- $('modeHelp').textContent=state.mode==='auto'?'Start the walking cycle. Stop holds the current pose.':'Start to enable joint controls. Stop freezes the pose.';
+ const sel=state.mode==='manual'?'manual':state.activity==='walk'?'auto':state.activity==='sit'?'sit':'stairs';
+ for(const id of ['manual','auto','stairs','sit'])$(id).classList.toggle('selected',id===sel);
+ $('activityPanel').hidden=state.mode!=='auto';
+ $('walkPanel').hidden=state.activity!=='walk';$('stairsPanel').hidden=!state.activity.startsWith('stairs');$('sitPanel').hidden=state.activity!=='sit';
+ $('surfacePanel').hidden=state.mode==='auto'&&state.activity!=='walk';
+ $('activityName').textContent=(ACTIVITY_LABELS[state.activity]||'').toUpperCase();
+ $('stairsUp').classList.toggle('selected',state.stairsDir==='stairsUp');$('stairsDown').classList.toggle('selected',state.stairsDir==='stairsDown');
+ $('trip').disabled=!state.running||state.mode!=='auto'||state.activity!=='walk';
+ $('modeHelp').textContent=state.mode!=='auto'?'Start to enable joint controls. Stop freezes the pose.':state.activity==='walk'?'Start the walking cycle. Stop holds the current pose.':state.activity==='sit'?'Start the sit-to-stand cycle. Stop holds the current pose.':'Start climbing. Stop holds the current pose.';
 }
 function reset(){
  if(bridgeToken)bridgeDisarm();
- Object.assign(state,{running:false,time:0,phase:0,distance:0,knee:0,kneeVelocity:0,pitch:0,roll:0,height:0,hip:0});$('hip').value=0;$('knee').value=0;$('height').value=0;$('heightV').textContent='0.0 mm';$('stick').style.transform='translate(0,0)';history.length=0;samples.length=0;lastSample=0;lastTerrain=-1;filteredPitch=0;filteredRoll=0;state.supportDelta=0;$('supportState').textContent='Left / right support: —';
- // Auto mode shows the heel-strike pose before Start.
- state.cadenceScale=0;solvePose(0);updateTerrain();drawChart();syncControls();$('simTime').textContent='00:00.0';
+ Object.assign(state,{running:false,time:0,phase:0,distance:0,knee:0,kneeVelocity:0,pitch:0,roll:0,height:0,hip:0,hipVelocity:0});$('hip').value=0;$('knee').value=0;$('height').value=0;$('heightV').textContent='0.0 mm';$('stick').style.transform='translate(0,0)';history.length=0;samples.length=0;jointHistory.length=0;energy.reset();lastSample=0;lastTerrain=-1;filteredPitch=0;filteredRoll=0;state.supportDelta=0;$('supportState').textContent='Left / right support: —';
+ // Auto modes show the starting pose before Start.
+ if(engine)engine.reset(state.activity,{speed:+$('speed').value});
+ solvePose(0);updateStats();updateTerrain();drawChart();renderEnergy();syncControls();$('simTime').textContent='00:00.0';
 }
 function setJoystick(x,y){if(!state.running||state.mode!=='manual')return;const len=Math.hypot(x,y);if(len>1){x/=len;y/=len;}state.pitch=-y*18;state.roll=x*12;$('stick').style.transform=`translate(${x*43}px,${y*43}px)`;}
 function releaseJoy(){joyDrag=false;if(state.running&&state.mode==='manual')setJoystick(0,0);}
-function drawChart(){
- const el=$('chart'),r=el.getBoundingClientRect(),dpr=Math.min(devicePixelRatio||1,2);el.width=Math.max(1,r.width*dpr);el.height=Math.max(1,r.height*dpr);const ctx=el.getContext('2d');ctx.scale(dpr,dpr);const w=r.width,h=r.height,pad=25;
- ctx.font='11px monospace';ctx.lineWidth=1;ctx.strokeStyle='#303c46';ctx.fillStyle='#82909b';
- for(const v of [-20,-10,0,10,20]){const y=8+(20-v)/40*(h-25);ctx.beginPath();ctx.moveTo(pad,y);ctx.lineTo(w,y);ctx.stroke();if(v%20===0)ctx.fillText(String(v),0,y+4);}
- for(const [key,color] of [['pitch','#ff903d'],['roll','#6bd4e5']]){ctx.strokeStyle=color;ctx.lineWidth=1.8;ctx.beginPath();let first=true;for(const s of history){const x=w-(state.time-s.time)/10*(w-pad),y=8+(20-s[key])/40*(h-25);if(x<pad)continue;first?ctx.moveTo(x,y):ctx.lineTo(x,y);first=false;}ctx.stroke();}
+function chartFrame(el){const r=el.getBoundingClientRect(),dpr=Math.min(devicePixelRatio||1,2);el.width=Math.max(1,r.width*dpr);el.height=Math.max(1,r.height*dpr);const ctx=el.getContext('2d');ctx.scale(dpr,dpr);ctx.font='11px monospace';return {ctx,w:r.width,h:r.height};}
+function plotLines(ctx,w,h,rows,now,series,lo,hi,ticks){
+ const pad=32,y=v=>8+(hi-v)/(hi-lo)*(h-25);
+ ctx.lineWidth=1;ctx.strokeStyle='#303c46';ctx.fillStyle='#82909b';
+ for(const v of ticks){ctx.beginPath();ctx.moveTo(pad,y(v));ctx.lineTo(w,y(v));ctx.stroke();ctx.fillText(String(Math.round(v)),0,y(v)+4);}
+ for(const s of series){
+  ctx.strokeStyle=s.color;ctx.lineWidth=s.width||1.8;ctx.setLineDash(s.dash||[]);ctx.beginPath();let first=true;
+  for(const row of rows){const v=row[s.key];if(v==null||!Number.isFinite(v)){first=true;continue;}const x=w-(now-row.t)/10*(w-pad);if(x<pad)continue;first?ctx.moveTo(x,y(v)):ctx.lineTo(x,y(v));first=false;}
+  ctx.stroke();ctx.setLineDash([]);
+ }
  ctx.fillStyle='#82909b';ctx.fillText('−10 s',pad,h-1);ctx.fillText('now',w-25,h-1);
+}
+function niceRange(rows,keys,minSpan){
+ let lo=Infinity,hi=-Infinity;for(const r of rows)for(const k of keys){const v=r[k];if(v!=null&&Number.isFinite(v)){lo=Math.min(lo,v);hi=Math.max(hi,v);}}
+ if(!Number.isFinite(lo)){lo=-minSpan/2;hi=minSpan/2;}
+ const span=Math.max(minSpan,hi-lo),mid=(hi+lo)/2,step=span>120?40:span>60?20:span>30?10:5;
+ lo=Math.floor((mid-span/2-step*.2)/step)*step;hi=Math.ceil((mid+span/2+step*.2)/step)*step;
+ const ticks=[];for(let v=lo;v<=hi+1e-9;v+=step)ticks.push(v);return {lo,hi,ticks};
+}
+function drawChart(){
+ const {ctx,w,h}=chartFrame($('chart'));
+ if(state.chart==='joints'){
+  const keys=['hipT','hipC','hipA','kneeT','kneeC','kneeA'],r=niceRange(jointHistory,keys,40);
+  plotLines(ctx,w,h,jointHistory,state.time,[
+   {key:'hipT',color:'#52c8bd',dash:[5,4],width:1.2},{key:'kneeT',color:'#ff903d',dash:[5,4],width:1.2},
+   {key:'hipC',color:'#52c8bd'},{key:'kneeC',color:'#ff903d'},
+   {key:'hipA',color:'#a8f0e4',width:1.2},{key:'kneeA',color:'#ffd2a8',width:1.2}],r.lo,r.hi,r.ticks);
+ }else if(state.chart==='energy'){
+  const now=performance.now()/1000,rows=energy.history.map(x=>({...x,t:state.time-(now-x.t)}));
+  const r=niceRange(rows,['knee','hip','ankle','total'],4);
+  plotLines(ctx,w,h,rows,state.time,[{key:'total',color:'#e8edf0',width:1.2},{key:'knee',color:'#ff903d'},{key:'hip',color:'#52c8bd'},{key:'ankle',color:'#b79cff'}],r.lo,r.hi,r.ticks);
+  if(!energy.history.some(x=>x.total!=null)){ctx.fillStyle='#82909b';ctx.fillText('No live motor feedback · arm the bridge to measure power',40,h/2);}
+ }else{
+  plotLines(ctx,w,h,history.map(x=>({...x,t:x.time})),state.time,[{key:'pitch',color:'#ff903d'},{key:'roll',color:'#6bd4e5'}],-20,20,[-20,-10,0,10,20]);
+ }
+}
+const LEGENDS={
+ ankle:'<span class="legend pitch"></span> Pitch <span class="legend roll"></span> Roll <span class="muted">±20° · last 10 s</span>',
+ joints:'<span class="legend hip"></span> Hip <span class="legend knee"></span> Knee <span class="muted">dashed target · solid command · light actual</span>',
+ energy:'<span class="legend knee"></span> Knee <span class="legend hip"></span> Hip <span class="legend ankle"></span> Ankle <span class="legend total"></span> Total <span class="muted">mechanical W</span>'};
+function setChart(name){
+ state.chart=name;
+ for(const [id,key] of [['tabAnkle','ankle'],['tabJoints','joints'],['tabEnergy','energy']]){$(id).classList.toggle('selected',key===name);$(id).setAttribute('aria-selected',String(key===name));}
+ $('chartLegend').innerHTML=LEGENDS[name];$('energyPanel').hidden=name!=='energy';$('actuatorPanel').hidden=name==='energy';
+ drawChart();renderEnergy();
+}
+const fmtW=v=>v==null?'—':Math.abs(v)>=100?v.toFixed(0):v.toFixed(1),fmtJ=v=>Math.abs(v)>=1000?(v/1000).toFixed(2)+'k':v.toFixed(1);
+function renderEnergy(){
+ if(state.chart!=='energy')return;
+ const rows=DEVICES.map(name=>{const d=energy.devices[name];return `<tr><td>${name[0].toUpperCase()+name.slice(1)}</td><td class="${d.power==null?'na':''}">${fmtW(d.power)}</td><td>${fmtJ(d.positive)}</td><td>${fmtJ(-d.negative)}</td></tr>`;});
+ const t=energy.totals(),live=DEVICES.filter(n=>energy.devices[n].power!=null),now=live.reduce((a,n)=>a+energy.devices[n].power,0);
+ rows.push(`<tr class="total"><td>Total</td><td>${live.length?fmtW(now):'—'}</td><td>${fmtJ(t.positive)}</td><td>${fmtJ(-t.negative)}</td></tr>`);
+ $('energyTable').querySelector('tbody').innerHTML=rows.join('');
+ const s=live.length?energy.perStride():null;
+ const elec=energy.hasElectrical?` Electrical (DC sensor): ${(t.electricalJ/3600).toFixed(3)} Wh.`:' Electrical use needs DC sensors (POST /api/power).';
+ $('energyNote').textContent=(live.length?'':'No live feedback · arm the bridge. ')+(s?`Per stride: +${s.positive.toFixed(1)} J / −${(-s.negative).toFixed(1)} J over ${s.duration.toFixed(2)} s.`:'+J delivered, −J absorbed.')+elec;
 }
 function animate(){
  requestAnimationFrame(animate);const dt=Math.min(clock.getDelta(),.05);
- if(state.ready&&state.running){state.time+=dt;if(state.mode==='auto'){// Soft start: cadence eases in over 1.5 s so joint speeds start from zero.
-   state.cadenceScale=smooth5((state.time-(state.startTime||0))/1.5);const speed=+$('speed').value*state.cadenceScale;state.distance+=speed*1000*dt;state.phase=(state.phase+speed*1000/GAIT.stride*dt)%1;}solvePose(dt);
-  if(state.time-lastTerrain>1/30){updateTerrain();lastTerrain=state.time;}
-  if(state.time-lastSample>=.05){lastSample=state.time;const row={time:state.time,pitch:state.correctionPitch,roll:state.correctionRoll,knee:state.knee,hip:state.hip,hipVelocity:state.hipVelocity,anklePitch:state.appliedPitch,ankleRoll:state.appliedRoll,height:state.height,supportDelta:state.supportDelta||0,a1:state.extensions[0]-20,a2:state.extensions[1]-20,a3:state.extensions[2]-20,limited:state.limited?1:0};history.push(row);samples.push(row);while(history.length&&history[0].time<state.time-10)history.shift();if(samples.length>72000)samples.shift();drawChart();}
+ if(state.ready&&state.running){state.time+=dt;solvePose(dt);
+  if(state.mode==='auto')energy.cycle(gp.cycles,state.time);
+  if(state.time-lastTerrain>1/30&&(state.mode==='manual'||state.activity==='walk')){updateTerrain();lastTerrain=state.time;}
+  if(state.time-lastSample>=.05){lastSample=state.time;
+   const row={time:state.time,activity:state.mode==='auto'?state.activity:'manual',phase:state.mode==='auto'?gp.phase:0,pitch:state.correctionPitch,roll:state.correctionRoll,
+    knee:state.knee,hip:state.hip,kneeTarget:state.targetKnee,hipTarget:state.targetHip,kneeVelocity:state.kneeVelocity,hipVelocity:state.hipVelocity,
+    kneeActual:state.actualKnee,hipActual:state.actualHip,anklePitch:state.appliedPitch,ankleRoll:state.appliedRoll,height:state.height,supportDelta:state.supportDelta||0,
+    a1:state.extensions[0]-20,a2:state.extensions[1]-20,a3:state.extensions[2]-20,limited:state.limited?1:0,clamped:state.clamped?1:0,
+    pelvisX:gp?gp.pelvis[0]:null,pelvisY:gp?gp.pelvis[1]:null,
+    kneePowerW:energy.devices.knee.power,hipPowerW:energy.devices.hip.power,anklePowerW:energy.devices.ankle.power};
+   history.push(row);samples.push(row);while(history.length&&history[0].time<state.time-10)history.shift();if(samples.length>72000)samples.shift();
+   jointHistory.push({t:state.time,hipT:state.targetHip,hipC:state.hip,hipA:state.actualHip,kneeT:state.targetKnee,kneeC:state.knee,kneeA:state.actualKnee});
+   while(jointHistory.length&&jointHistory[0].t<state.time-10)jointHistory.shift();
+   drawChart();}
   $('simTime').textContent=`${String(Math.floor(state.time/60)).padStart(2,'0')}:${(state.time%60).toFixed(1).padStart(4,'0')}`;
  }
+ const now=performance.now();
+ if(now-lastStats>250){lastStats=now;updateStats();renderEnergy();if(!state.running&&state.chart==='energy')drawChart();}
  if(renderer)renderer.render(scene,camera);
 }
 function events(){
@@ -257,8 +405,19 @@ function events(){
  $('motorArm').onclick=async()=>{if(!bridgeToken||!state.ready||bridgeArmPending)return;const generation=bridgeGeneration;bridgeArmPending=true;$('motorArm').disabled=true;$('motorDisarm').disabled=false;try{await bridgePost('update',{angle_deg:state.knee,hip_angle_deg:state.hip,hip_velocity_deg_s:state.running&&state.mode==='auto'?state.hipVelocity:0,extensions_mm:[...state.extensions],velocity_deg_s:state.running&&state.mode==='auto'?state.kneeVelocity:0,running:state.running,mode:state.mode});if(generation===bridgeGeneration)await bridgePost('arm');}catch(e){$('motorStatus').textContent=`Motor: ${e.message}`;}finally{bridgeArmPending=false;$('motorArm').disabled=!bridgeToken||bridgeArmed;$('motorDisarm').disabled=!bridgeToken||!bridgeArmed;}};
  $('hipZero').onclick=async()=>{if(!bridgeToken||bridgeArmed||state.running)return;try{await bridgePost('update',{angle_deg:state.knee,hip_angle_deg:state.hip,running:false,mode:state.mode,extensions_mm:[...state.extensions]});await bridgePost('zero',{joint:'hip'});}catch(e){$('hipStatus').textContent=`Hip: ${e.message}`;}};
  $('motorDisarm').onclick=bridgeDisarm;
- $('start').onclick=()=>{state.running=true;state.startTime=state.time;clock.getDelta();syncControls();};$('stop').onclick=()=>{state.running=false;joyDrag=false;syncControls();};$('reset').onclick=reset;
- for(const mode of ['manual','auto'])$(mode).onclick=()=>{state.mode=mode;reset();};
+ $('start').onclick=()=>{state.running=true;if(engine)engine.startTime=engine.time;clock.getDelta();syncControls();};$('stop').onclick=()=>{state.running=false;joyDrag=false;syncControls();};$('reset').onclick=reset;
+ const setActivity=(mode,activity)=>{state.mode=mode;if(activity)state.activity=activity;reset();};
+ $('manual').onclick=()=>setActivity('manual');$('auto').onclick=()=>setActivity('auto','walk');
+ $('stairs').onclick=()=>setActivity('auto',state.stairsDir);$('sit').onclick=()=>setActivity('auto','sit');
+ for(const dir of ['stairsUp','stairsDown'])$(dir).onclick=()=>{state.stairsDir=dir;setActivity('auto',dir);};
+ const tuning=[['clearance',v=>`+${v}°`],['pushOff',v=>`${v}%`],['stanceKnee',v=>`${v}%`],['stairCadence',v=>`${v} steps/min`],['sitHold',v=>`${(+v).toFixed(1)} s`]];
+ for(const [id,fmt] of tuning)$(id).oninput=()=>{$(id+'V').textContent=fmt($(id).value);applyGaitParams();if(state.ready&&!state.running)solvePose(0);};
+ $('gaitDefaults').onclick=()=>{for(const [id,v] of [['clearance',0],['pushOff',100],['stanceKnee',100]]){$(id).value=v;$(id).oninput();}};
+ $('autoTrip').onchange=()=>applyGaitParams();
+ $('trip').onclick=()=>{if(engine&&state.running)engine.trip();};
+ $('fixedMount').onchange=()=>{if(engine)engine.pelvis=[...engine.home];if(state.ready&&!state.running)solvePose(0);};
+ for(const [id,key] of [['tabAnkle','ankle'],['tabJoints','joints'],['tabEnergy','energy']])$(id).onclick=()=>setChart(key);
+ $('energyReset').onclick=()=>{energy.reset();renderEnergy();drawChart();};
  $('hip').oninput=()=>{$('hipV').textContent=`${(+$('hip').value).toFixed(1)}°`;};$('knee').oninput=()=>{$('kneeV').textContent=`${(+$('knee').value).toFixed(1)}°`;};$('height').oninput=()=>{$('heightV').textContent=`${(+$('height').value).toFixed(1)} mm`;};
  $('speed').oninput=()=>{$('speedV').textContent=`${(+$('speed').value).toFixed(2)} m/s`;$('slow').classList.toggle('selected',+$('speed').value<=.3);$('normal').classList.toggle('selected',+$('speed').value>.3);};
  for(const [id,s] of [['slow',.3],['normal',.6]])$(id).onclick=()=>{$('speed').value=s;$('speed').oninput();};
@@ -272,7 +431,7 @@ function events(){
  const canvas=$('scene');canvas.oncontextmenu=e=>e.preventDefault();canvas.onpointerdown=e=>{drag={x:e.clientX,y:e.clientY,button:e.button};pointerDown={x:e.clientX,y:e.clientY};canvas.setPointerCapture(e.pointerId);};canvas.onpointermove=e=>{if(!drag)return;const dx=e.clientX-drag.x,dy=e.clientY-drag.y;if(drag.button===2||e.shiftKey){const right=new THREE.Vector3().setFromMatrixColumn(camera.matrix,0),up=new THREE.Vector3().setFromMatrixColumn(camera.matrix,1);orbit.target.addScaledVector(right,-dx*orbit.radius*.001).addScaledVector(up,dy*orbit.radius*.001);}else{orbit.theta+=dx*.007;orbit.phi=clamp(orbit.phi+dy*.006,.15,Math.PI-.15);}drag.x=e.clientX;drag.y=e.clientY;cameraUpdate();};canvas.onpointerup=e=>{if(pointerDown&&Math.hypot(e.clientX-pointerDown.x,e.clientY-pointerDown.y)<4&&state.ready){const r=canvas.getBoundingClientRect(),ray=new THREE.Raycaster();ray.setFromCamera(new THREE.Vector2((e.clientX-r.left)/r.width*2-1,-(e.clientY-r.top)/r.height*2+1),camera);const hit=ray.intersectObjects(meshes.filter(m=>m.visible),false)[0];$('partName').textContent=hit?hit.object.userData.part.path.replace('CYBER_LEG_CAD / ',''):'Drag to orbit · wheel to zoom · right-drag to pan';}drag=null;};canvas.onpointercancel=()=>drag=null;
  canvas.addEventListener('wheel',e=>{e.preventDefault();orbit.radius=clamp(orbit.radius*Math.exp(e.deltaY*.001),250,4800);cameraUpdate();},{passive:false});
  document.querySelectorAll('[data-view]').forEach(b=>b.onclick=()=>{const v=b.dataset.view;if(v==='front'){orbit.theta=0;orbit.phi=Math.PI/2;}else if(v==='side'){orbit.theta=Math.PI/2;orbit.phi=Math.PI/2;}else{orbit.theta=1.05;orbit.phi=1.27;fitView();}cameraUpdate();document.querySelectorAll('[data-view]').forEach(x=>x.classList.toggle('selected',x===b));});
- $('export').onclick=()=>{if(!samples.length){alert('Start the simulator to record telemetry first.');return;}const keys=Object.keys(samples[0]),csv=[keys.join(','),...samples.map(s=>keys.map(k=>Number(s[k]).toFixed(4)).join(','))].join('\n');const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));a.download='CYBER_LEG_telemetry.csv';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);};
+ $('export').onclick=()=>{if(!samples.length){alert('Start the simulator to record telemetry first.');return;}const keys=Object.keys(samples[0]),cell=v=>v==null?'':typeof v==='string'?v:Number(v).toFixed(4),csv=[keys.join(','),...samples.map(s=>keys.map(k=>cell(s[k])).join(','))].join('\n');const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));a.download='CYBER_LEG_telemetry.csv';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);};
  document.addEventListener('visibilitychange',()=>{if(document.hidden){if(state.running){state.running=false;syncControls();}if(bridgeToken)bridgeDisarm();}});
 }
 async function boot(){

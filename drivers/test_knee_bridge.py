@@ -7,7 +7,7 @@ from unittest.mock import patch
 from http.server import ThreadingHTTPServer
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
-from knee_bridge import KneeBridge, STALE_SECONDS, make_handler, validate_gains, PTM_DEFAULTS, BridgeServer, DT, MAX_VELOCITY, THETA_MAX, validate_mapping
+from knee_bridge import KneeBridge, STALE_SECONDS, EXTRAPOLATE_LINEAR, EXTRAPOLATE_DECAY, EXTRAPOLATE_CUTOFF, make_handler, validate_gains, PTM_DEFAULTS, BridgeServer, DT, MAX_VELOCITY, THETA_MAX, validate_mapping
 from motorevo_driver import MotorevoMotor
 import can
 
@@ -174,7 +174,11 @@ class BridgeTests(unittest.TestCase):
         self.bridge.update(30, True, 'auto', 180)
         now = self.bridge.last_update
         self.assertAlmostEqual(self.bridge._command_velocity(now), math.pi)
-        self.assertEqual(self.bridge._command_velocity(now + DT * 3), 0)
+        self.assertAlmostEqual(self.bridge._command_velocity(now + EXTRAPOLATE_LINEAR), math.pi)
+        late = self.bridge._command_velocity(now + EXTRAPOLATE_LINEAR + EXTRAPOLATE_DECAY)
+        self.assertAlmostEqual(late, math.pi / math.e)
+        self.assertEqual(self.bridge._command_velocity(now + EXTRAPOLATE_CUTOFF), 0)
+        self.assertEqual(self.bridge._command_velocity(now + STALE_SECONDS), 0)
         self.bridge.update(30, False, 'auto', 180)
         self.assertEqual(self.bridge._command_velocity(self.bridge.last_update), 0)
         self.bridge.update(30, True, 'manual', 180)
@@ -195,6 +199,60 @@ class BridgeTests(unittest.TestCase):
         finally:
             reverse.close()
 
+    def test_late_update_extrapolates_smoothly_within_limits(self):
+        self.bridge.stop_event.set()
+        self.bridge.thread.join()
+        self.bridge.update(30, True, 'auto', 90)  # +pi/2 rad/s
+        start, goal = self.bridge.last_update, math.radians(30)
+        previous_position, previous_velocity = goal, math.pi / 2
+        for i in range(1, 60):
+            now = start + i * 0.005
+            self.bridge._advance_setpoint(now, 0.005)
+            velocity = self.bridge._command_velocity(now)
+            # Position keeps moving forward and never jumps; velocity never rises or flips.
+            self.assertGreaterEqual(self.bridge.setpoint, previous_position - 1e-12)
+            self.assertLessEqual(self.bridge.setpoint - previous_position, math.pi / 2 * 0.005 + 1e-9)
+            self.assertLessEqual(velocity, previous_velocity + 1e-12)
+            self.assertGreaterEqual(velocity, 0)
+            previous_position, previous_velocity = self.bridge.setpoint, velocity
+        # Within normal jitter the reference follows the browser's velocity exactly.
+        self.bridge._advance_setpoint(start + 0.02, 0)
+        self.assertAlmostEqual(self.bridge.setpoint, goal + math.pi / 2 * 0.02)
+        # Total travel is bounded however late the next packet is.
+        self.bridge._advance_setpoint(start + 10, 0)
+        self.assertLessEqual(self.bridge.setpoint - goal, math.pi / 2 * (EXTRAPOLATE_LINEAR + EXTRAPOLATE_DECAY) + 1e-9)
+        self.assertEqual(self.bridge._command_velocity(start + 10), 0)
+        # A fresh update replaces the extrapolated reference immediately.
+        self.bridge.update(31, True, 'auto', 90)
+        self.bridge._advance_setpoint(self.bridge.last_update, 0)
+        self.assertAlmostEqual(self.bridge.setpoint, math.radians(31))
+
+    def test_extrapolation_never_crosses_command_limits(self):
+        self.bridge.stop_event.set()
+        self.bridge.thread.join()
+        self.bridge.soft_limits_deg = [0, 40]
+        self.bridge.update(39.9, True, 'auto', 500)
+        self.bridge._advance_setpoint(self.bridge.last_update + 0.1, 0)
+        self.assertAlmostEqual(self.bridge.setpoint, math.radians(40))
+        self.assertEqual(self.bridge._command_velocity(self.bridge.last_update + 0.1), 0)
+        self.bridge.update(0.1, True, 'auto', -500)
+        self.bridge._advance_setpoint(self.bridge.last_update + 0.1, 0)
+        self.assertAlmostEqual(self.bridge.setpoint, 0)
+        self.assertEqual(self.bridge._command_velocity(self.bridge.last_update + 0.1), 0)
+
+    def test_no_extrapolation_when_stopped_or_manual(self):
+        self.bridge.stop_event.set()
+        self.bridge.thread.join()
+        self.bridge.update(30, True, 'manual', 90)
+        self.bridge._advance_setpoint(self.bridge.last_update + 0.03, 0)
+        self.assertAlmostEqual(self.bridge.setpoint, math.radians(30))
+        self.bridge.setpoint = math.radians(20)
+        self.bridge.armed = True
+        self.bridge.update(30, False, 'auto', 90)
+        self.bridge._advance_setpoint(self.bridge.last_update + 0.03, 0)
+        self.assertAlmostEqual(self.bridge.setpoint, math.radians(20))
+        self.bridge.armed = False
+
     def test_auto_velocity_reaches_motor(self):
         self.bridge.update(30, True, 'auto', 180)
         self.bridge.arm()
@@ -203,8 +261,10 @@ class BridgeTests(unittest.TestCase):
             time.sleep(0.01)
         moving = [c for c in self.motor.commands if c[2]['vel_rad_s'] != 0]
         self.assertTrue(moving)
-        self.assertAlmostEqual(moving[-1][2]['vel_rad_s'], math.pi)
-        self.assertAlmostEqual(moving[-1][1], math.radians(30))
+        # Between 10 ms browser updates the reference moves along the velocity.
+        self.assertLessEqual(moving[-1][2]['vel_rad_s'], math.pi + 1e-12)
+        self.assertGreater(moving[-1][2]['vel_rad_s'], 0)
+        self.assertTrue(math.radians(30) - 1e-9 <= moving[-1][1] <= math.radians(30) + math.pi * (EXTRAPOLATE_LINEAR + EXTRAPOLATE_DECAY))
 
     def test_gait_command_timing_at_simulator_speeds(self):
         self.bridge.stop_event.set()

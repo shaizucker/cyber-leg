@@ -1,5 +1,5 @@
 import * as T from './three.module.min.js';
-import {footPath,clamp,rad} from './motion.js';
+import {clamp,rad} from './motion.js';
 
 // Geometric two-link limb, with a forward knee. No dynamics or balance model.
 export function legIK(hip,ankle,upper=420,lower=420){
@@ -13,8 +13,8 @@ export function legIK(hip,ankle,upper=420,lower=420){
 }
 
 export class WalkingDummy{
- constructor(scene,root,kneePivot){
-  this.root=root;this.scene=scene;this.materials=[];this.joints=[];
+ constructor(scene,root,kneePivot,{upper=420,lower=420}={}){
+  this.root=root;this.scene=scene;this.materials=[];this.joints=[];this.upper=upper;this.lower=lower;
   const material=(color,alpha=1)=>{const m=new T.MeshStandardMaterial({color,transparent:true,opacity:.28*alpha,roughness:.65,metalness:.02,depthWrite:false,side:T.DoubleSide});m.userData.alpha=alpha;this.materials.push(m);return m;};
   const skin=material(0x9bd5d7),residual=material(0xe7ba8d,1.5),socketMat=material(0xffb368,1.3),jointMat=material(0xbbeaf0,.85);
   this.attached=new T.Group();root.add(this.attached);
@@ -52,22 +52,26 @@ export class WalkingDummy{
  }
  setOpacity(value){for(const m of this.materials)m.opacity=Math.min(.85,value*m.userData.alpha);}
  setVisible(show){this.attached.visible=show;this.body.visible=show;}
- update(state,heightAt){
+ // info (activities): {soundAnkle:[x,y,z] world, soundPitch, trunk, swing, phase}
+ // info (manual): {heightAt(x,z)} — the sound leg stands beside the prosthesis.
+ update(state,info={}){
   this.root.updateMatrixWorld(true);
-  const hipWorld=this.root.localToWorld(this.hipLocal.clone());
-  this.body.position.copy(hipWorld);this.body.rotation.set(0,0,0);this.body.updateMatrixWorld(true);
-  const walking=state.mode==='auto',phase=walking?(state.phase+.5)%1:0;
-  // Opposite leg uses the same belt-matched foot path, half a cycle out of phase.
-  const g=footPath(phase),s=g.stance?0:g.s;
-  const x=walking?hipWorld.x+g.x:hipWorld.x+30;
-  const z=hipWorld.z-170,ankleWorld=new T.Vector3(x,heightAt(x,z)+38+(walking?g.lift:0),z);
+  const hipWorld=this.root.localToWorld(this.hipLocal.clone()),trunk=info.trunk||0;
+  // Forward trunk lean (sit-to-stand) rotates the body about the hip axis.
+  this.body.position.copy(hipWorld);this.body.rotation.set(0,0,-trunk*rad);this.body.updateMatrixWorld(true);
+  let ankleWorld,pitch=0;
+  if(info.soundAnkle){ankleWorld=new T.Vector3(...info.soundAnkle);pitch=info.soundPitch||0;}
+  else{const x=hipWorld.x+30,z=hipWorld.z-170;ankleWorld=new T.Vector3(x,(info.heightAt?info.heightAt(x,z):0)+70,z);}
   const target=this.body.worldToLocal(ankleWorld.clone());
-  const solved=legIK(this.otherHip,target);
+  const solved=legIK(this.otherHip,target,this.upper,this.lower);
   this.segment(this.otherThigh,this.otherHip,solved.knee);this.segment(this.otherShin,solved.knee,solved.ankle);
-  this.otherKnee.position.copy(solved.knee);this.otherFoot.position.copy(solved.ankle).add(new T.Vector3(40,-7,0));
-  this.otherFoot.rotation.z=walking&&!g.stance?8*Math.sin(Math.PI*s)*rad:0;
+  // Foot sole sits ~70 mm below the ankle, like the prosthetic foot it mirrors.
+  const local=(pitch+trunk)*rad;
+  this.otherKnee.position.copy(solved.knee);this.otherFoot.position.copy(solved.ankle).add(new T.Vector3(40*Math.cos(local)+36*Math.sin(local),40*Math.sin(local)-36*Math.cos(local),0));
+  this.otherFoot.rotation.z=local;
+  const walking=!!info.swing;
   for(const [i,a] of this.arms.entries()){
-   const angle=(walking?18*Math.sin(state.phase*Math.PI*2+(i?Math.PI:0)):0)*rad;
+   const angle=(walking?18*Math.sin((info.phase||0)*Math.PI*2+(i?Math.PI:0)):trunk*.6)*rad;
    const elbow=a.shoulder.clone().add(new T.Vector3(Math.sin(angle)*265,-Math.cos(angle)*265,0));
    const hand=elbow.clone().add(new T.Vector3(Math.sin(angle+.25)*235,-Math.cos(angle+.25)*235,0));
    this.segment(a.upper,a.shoulder,elbow);this.segment(a.lower,elbow,hand);a.elbow.position.copy(elbow);a.hand.position.copy(hand);

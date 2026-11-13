@@ -20,6 +20,17 @@ DT = 0.02
 CONTROL_OVERRUN_YIELD = 0.001  # Let queued HTTP updates acquire the state lock.
 FEEDBACK_TIMEOUT = 0.03  # Allow measured USB scheduling jitter; never retry motion commands.
 STALE_SECONDS = 0.5
+# Between browser updates the last target is extrapolated along its velocity
+# feed-forward instead of holding a stale position with zero velocity, which
+# produced a braking kick and then a position jump on every late Wi-Fi packet.
+# Up to EXTRAPOLATE_LINEAR the reference keeps its full velocity (normal network
+# jitter). After that the velocity decays exponentially with EXTRAPOLATE_DECAY,
+# so the reference comes to a smooth stop within roughly EXTRAPOLATE_LINEAR +
+# EXTRAPOLATE_DECAY of motion. Extrapolated targets never leave the command
+# limits, and the unchanged STALE_SECONDS watchdog still disarms.
+EXTRAPOLATE_LINEAR = 0.04
+EXTRAPOLATE_DECAY = 0.04
+EXTRAPOLATE_CUTOFF = 0.25  # Beyond this age the reference is held with zero velocity.
 MAX_VELOCITY = 10.0  # Configured P-T-M velocity encoding range, rad/s.
 SIM_MAX_DEG = 105.0
 # Match gemini-code-gui.py and the current MParameter Studio configuration.
@@ -214,16 +225,53 @@ class KneeBridge:
                        '; reported angle may be clamped at the boundary; resolve the physical position/reference before retrying')
         return detail
 
+    def _extrapolation(self, age):
+        """(position gain in seconds, velocity factor) for a reference of this age."""
+        if age <= 0:
+            return 0.0, 1.0
+        if age <= EXTRAPOLATE_LINEAR:
+            return age, 1.0
+        if age >= EXTRAPOLATE_CUTOFF:
+            age = EXTRAPOLATE_CUTOFF
+            return EXTRAPOLATE_LINEAR + EXTRAPOLATE_DECAY * -math.expm1(-(age - EXTRAPOLATE_LINEAR) / EXTRAPOLATE_DECAY), 0.0
+        decay = math.exp(-(age - EXTRAPOLATE_LINEAR) / EXTRAPOLATE_DECAY)
+        return EXTRAPOLATE_LINEAR + EXTRAPOLATE_DECAY * (1 - decay), decay
+
+    def command_bounds(self):
+        """Motor-coordinate interval allowed by the signed command limits."""
+        ends = []
+        for angle in self.soft_limits_deg:
+            normalized = angle - self.joint_min_deg
+            ends.append(self.sign*self.angle_scale*min(math.radians(normalized), self.sim_max)+self.offset+self.reference_rad)
+        return max(self.theta_min, min(ends)), min(self.theta_max, max(ends))
+
+    def _extrapolating(self):
+        return self.running and self.mode == 'auto' and self.velocity != 0.0
+
     def _advance_setpoint(self, now, elapsed):
         if self.ankle and not self.ankle.status()['armed']:
             return  # Hold measured knee position until the ankle is ready too.
-        self.setpoint = self.goal
+        if self.goal is None or not self._extrapolating():
+            self.setpoint = self.goal
+            return
+        gain, _ = self._extrapolation(now - self.last_update)
+        low, high = self.command_bounds()
+        self.setpoint = max(low, min(high, self.goal + self.velocity * gain))
 
     def _command_velocity(self, now):
-        # A delayed browser update must not keep requesting motion indefinitely.
+        # A delayed browser update must not keep requesting motion indefinitely:
+        # the feed-forward decays smoothly after EXTRAPOLATE_LINEAR and is zero
+        # after EXTRAPOLATE_CUTOFF, or as soon as the reference reaches a limit.
         if self.ankle and not self.ankle.status()['armed']:
             return 0.0
-        return self.velocity if self.running and now - self.last_update <= DT * 2 else 0.0
+        if not self._extrapolating():
+            return 0.0
+        _, factor = self._extrapolation(now - self.last_update)
+        if self.setpoint is not None and factor:
+            low, high = self.command_bounds()
+            if (self.setpoint >= high - 1e-9 and self.velocity > 0) or (self.setpoint <= low + 1e-9 and self.velocity < 0):
+                return 0.0
+        return self.velocity * factor
 
     def _verify_motor_configuration(self, check_reference=True):
         self.configuration = self.read_motor_configuration(self.motor)

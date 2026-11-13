@@ -125,6 +125,10 @@ must match for Host/Origin validation. Do not confuse the localhost and LAN mode
   configurable using `--feedback-timeout-ms` within 10..50 ms.
 - Missing feedback and motor faults still stop control; motion commands are not
   automatically retried. Simulator freshness limit remains 500 ms for all outputs.
+- Between browser updates (auto mode, running) hip/knee targets are extrapolated
+  along their velocity feed-forward: linear for 40 ms, then decaying with a 40 ms
+  time constant, held after 250 ms, always clamped to the command limits
+  (Leons-UI branch; see docs/UI/leons_ui.md).
 - Each rotary joint rechecks freshness immediately before transmitting. After
   a cycle overrun, the worker yields 1 ms instead of immediately reacquiring the
   state lock, allowing queued HTTP target updates to run. Slow transactions can

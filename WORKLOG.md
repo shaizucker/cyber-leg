@@ -45,3 +45,23 @@ Open follow-ups:
 - Commission physical references/persistence, torque/current caps and tracking
   under load. Read-only tests do not prove movement containment or hard real-time behavior.
 - Add external DC sensors for measured electrical consumption.
+
+## 2026-11-13 - Leons-UI branch: activity modes, smoother gait, energy view
+
+- Branched `Leons-UI` from nirbadt/cyber-leg `smooth-gait` (56a3796, gait v1).
+- New `dist/gait.js` activity engine: joint-space C2 splines, moving pelvis with
+  the prosthetic foot locked to the belt in stance, rolling sound foot, cadence
+  from stride. Modes: walk, stairs up/down (moving staircase), sit-to-stand,
+  stumble recovery (elevating/lowering). Hip/knee commands clamped to bridge
+  limits with a visible MOTOR LIMIT badge; stairs/sit exceed the ±30° hip range.
+- Bridge: hip/knee targets now extrapolated along their velocity between
+  browser packets (linear 40 ms, then 40 ms decay, held after 250 ms), clamped
+  to command limits. Watchdog/fault handling unchanged.
+- UI: activity panel, gait tuning sliders, telemetry tabs (Ankle/Joints/Energy),
+  energy panel (mechanical W and J from motor feedback; not electrical use),
+  fixed-hip-mount bench view. `drivers/sim_bridge.py` runs the bridge on
+  simulated motors for UI work.
+- Validation: check_activities.mjs and check_energy.mjs pass; all hardware-free
+  Python suites pass (updated 3 assertions for extrapolation, added 3 tests).
+  Headless browser runs against sim_bridge armed and tracked in every mode.
+  No real hardware was moved. See docs/UI/leons_ui.md.

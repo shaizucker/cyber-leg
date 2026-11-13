@@ -159,9 +159,10 @@ class GuardBandTests(unittest.TestCase):
             joint.update(50, True, mode='auto', velocity_deg_s=20)
             joint._control_step(joint.last_update, .02)
             command = self.motor.commands[-1]
-            self.assertAlmostEqual(command[1], math.radians(25))
+            # The worker extrapolates by the microseconds since the update.
+            self.assertAlmostEqual(command[1], math.radians(25), places=4)
             self.assertAlmostEqual(command[2]['vel_rad_s'], math.radians(10))
-            self.assertAlmostEqual(joint.relative_degrees(command[1]), 50)
+            self.assertAlmostEqual(joint.relative_degrees(command[1]), 50, places=2)
             self.assertAlmostEqual(joint.mapped_target(105), THETA_MAX/2)
             self.assertEqual(joint.status()['angle_scale'], .5)
             for angle in (-1,106):

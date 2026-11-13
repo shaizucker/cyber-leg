@@ -8,7 +8,7 @@ from unittest.mock import patch
 from urllib.request import Request, urlopen
 
 import can
-from knee_bridge import KneeBridge, HipBridge, BridgeServer, make_handler, THETA_MAX, HIP_THETA_MIN, HIP_THETA_MAX
+from knee_bridge import KneeBridge, HipBridge, BridgeServer, make_handler, THETA_MAX, HIP_THETA_MIN, HIP_THETA_MAX, EXTRAPOLATE_LINEAR, EXTRAPOLATE_DECAY
 from motorevo_driver import SharedMotorNetwork
 from test_knee_bridge import FakeMotor
 
@@ -46,9 +46,13 @@ class HipTests(unittest.TestCase):
         self.bridge.arm()
         self.update(mode='auto', velocity_deg_s=12, hip_velocity_deg_s=-8)
         wait_for(lambda: self.hip_motor.commands and self.hip_motor.commands[-1][2]['vel_rad_s'] < 0)
-        self.assertAlmostEqual(self.knee_motor.commands[-1][1], math.radians(30))
-        self.assertAlmostEqual(self.hip_motor.commands[-1][1], math.radians(-12))
-        self.assertAlmostEqual(self.hip_motor.commands[-1][2]['vel_rad_s'], math.radians(-8))
+        # Commands are extrapolated along the velocity between browser updates.
+        knee, hip = self.knee_motor.commands[-1], self.hip_motor.commands[-1]
+        reach = EXTRAPOLATE_LINEAR + EXTRAPOLATE_DECAY
+        self.assertTrue(math.radians(30) - 1e-9 <= knee[1] <= math.radians(30) + math.radians(12) * reach)
+        self.assertTrue(math.radians(-12) - math.radians(8) * reach <= hip[1] <= math.radians(-12) + 1e-9)
+        self.assertLess(hip[2]['vel_rad_s'], 0)
+        self.assertGreaterEqual(hip[2]['vel_rad_s'], math.radians(-8) - 1e-12)
         self.assertEqual(self.bridge.status()['hip']['motor_id'], 2)
         self.assertTrue(self.hip.samples)
 
