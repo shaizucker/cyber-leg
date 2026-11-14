@@ -4,6 +4,7 @@ One worker owns this transport. refresh is called during SDO waits so all
 three position commands keep streaming while telemetry is being read.
 """
 import math
+from collections import deque
 import struct
 import time
 
@@ -58,6 +59,12 @@ class SeenpinActuators:
         self.limits = []
         self.positions = []
         self.startup_faults = {}
+        self.last_rx = {}
+        self.last_pdo = {}
+        self.max_pdo_gap = {}
+        self.recent_link = deque(maxlen=24)
+        self.adapter_events = deque(maxlen=8)
+        self.telemetry = {node: {} for node in self.nodes}
 
     def send(self, command):
         raw = (command + '\r').encode('ascii')
@@ -66,6 +73,15 @@ class SeenpinActuators:
 
     def send_frame(self, can_id, data):
         self.send(f'b{can_id:03X}{len(data):X}{data.hex().upper()}')
+        now = time.monotonic()
+        if 0x201 <= can_id <= 0x203 and len(data) == 7 and data[0] == 1:
+            node = can_id - 0x200
+            previous = self.last_pdo.get(node)
+            if previous is not None:
+                self.max_pdo_gap[node] = max(self.max_pdo_gap.get(node, 0), now - previous)
+            self.last_pdo[node] = now
+        elif 0x601 <= can_id <= 0x603:
+            self.recent_link.append((now, f'TX 0x{can_id:03X} {data.hex(" ").upper()}'))
 
     def listen(self, seconds):
         end = time.monotonic() + seconds
@@ -82,12 +98,44 @@ class SeenpinActuators:
                 del self.buffer[:i + 1]
                 if sep == 7:
                     raise RuntimeError('Seenpin adapter rejected a command (BEL)')
-                frame = parse_frame(raw.decode('ascii', errors='replace').strip())
+                line = raw.decode('ascii', errors='replace').strip()
+                if line.startswith('E') and len(line) == 9:
+                    now = time.monotonic()
+                    self.adapter_events.append((now, line))
+                    self.log(f'ANKLE adapter report: {line}')
+                frame = parse_frame(line)
                 if frame:
+                    now = time.monotonic()
+                    self.last_rx[frame[0]] = now
+                    if 0x181 <= frame[0] <= 0x183 and len(frame[1]) == 16 and frame[2] == 'b':
+                        fault, position, speed, force, current = struct.unpack('<Hhhhh', frame[1][:10])
+                        self.telemetry[frame[0]-0x180].update(
+                            position_mm=position/100, speed_mm_s=speed/10,
+                            force_n=force, motor_current_a=current/100,
+                            mechanical_power_w=force*speed/10000, sampled_at=now,
+                            pdo_fault=fault)
+                    self.recent_link.append((now, f'RX {line}'))
                     self.inbox.append(frame)
                     self.inbox = self.inbox[-256:]
             if len(self.buffer) > 16384:
                 raise RuntimeError('Invalid Seenpin serial stream')
+
+    def log_link_diagnostics(self, failed_node):
+        # Called only once all retries have failed; existing queued logging keeps
+        # file/terminal I/O off the control worker so shutdown is not delayed.
+        now = time.monotonic()
+        def age(stamp):
+            return 'never' if stamp is None else f'{max(0, now - stamp):.3f}s ago'
+        self.log(f'ANKLE LINK: node {failed_node} read failed; diagnostics only, no automatic recovery')
+        for node in self.nodes:
+            self.log(f'ANKLE LINK node {node}: heartbeat {age(self.last_rx.get(0x700 + node))}; '
+                     f'SDO reply {age(self.last_rx.get(0x580 + node))}; '
+                     f'last position TX {age(self.last_pdo.get(node))}; '
+                     f'max position TX gap {self.max_pdo_gap.get(node, 0) * 1000:.1f} ms')
+        events = ', '.join(f'{line} ({age(stamp)})' for stamp, line in self.adapter_events)
+        self.log(f'ANKLE LINK adapter reports: {events or "none received"}')
+        for stamp, line in list(self.recent_link)[-8:]:
+            self.log(f'ANKLE LINK recent {age(stamp)}: {line}')
 
     def read(self, node, index, sub, signed=False):
         key = struct.pack('<HB', index, sub)
@@ -105,7 +153,8 @@ class SeenpinActuators:
                     if not kind.islower() or can_id != 0x580 + node or len(data) < 4 or data[1:4] != key:
                         continue
                     if data[0] == 0x80:
-                        raise RuntimeError(f'Ankle node {node}: SDO abort {index:04X}:{sub:02X}')
+                        code = f' (code 0x{int.from_bytes(data[4:8], "little"):08X})' if len(data) >= 8 else ''
+                        raise RuntimeError(f'Ankle node {node}: SDO abort {index:04X}:{sub:02X}{code}')
                     size = {0x4F: 1, 0x4B: 2, 0x47: 3, 0x43: 4}.get(data[0])
                     if size is not None and len(data) >= 4 + size:
                         if attempt > 1:
@@ -114,6 +163,7 @@ class SeenpinActuators:
                 self.inbox.clear()
             if attempt < SDO_ATTEMPTS:
                 self.log(f'ANKLE node {node}: no SDO {index:04X}:{sub:02X} reply; retry {attempt + 1}/{SDO_ATTEMPTS}')
+        self.log_link_diagnostics(node)
         received = ', '.join(f'0x{x:03X}' for x in sorted(seen_ids)) or 'none'
         raise RuntimeError(f'Ankle node {node}: feedback timeout {index:04X}:{sub:02X} '
                            f'after {SDO_ATTEMPTS} attempts; RX IDs: {received}. '
@@ -125,6 +175,10 @@ class SeenpinActuators:
         for command in ('C', 'V', 'S8', 'Y5', 'M0', 'A0', 'O'):
             self.send(command)
             self.listen(0.1)
+        # RH02/CANable 2.5: report adapter CAN errors without changing frame
+        # format, bitrate, retry policy or any actuator parameter.
+        self.send('ME')
+        self.listen(0.01)
         for node in self.nodes:
             fault = self.read(node, 0x2010, 5)
             position = self.read(node, 0x2010, 2, signed=True) / 100
@@ -139,11 +193,81 @@ class SeenpinActuators:
                 raise RuntimeError(f'Ankle node {node}: invalid drive limits {low:.2f}..{high:.2f} mm')
             if not low <= position <= high:
                 raise RuntimeError(f'Ankle node {node}: position {position:.2f} mm outside {low:.2f}..{high:.2f} mm')
-            if not low <= 20 <= high:
-                raise RuntimeError(f'Ankle node {node}: neutral 20 mm is outside drive limits')
             self.positions.append(position)
             self.limits.append([low, high])
             self.log(f'ANKLE node {node}: {position:.2f} mm, limits {low:.2f}..{high:.2f} mm')
+
+    def write(self, node, index, sub, value, size=4, signed=False, verify_readback=True):
+        """Acknowledged SDO download; control settings require separate readback.
+
+        Only the optional PDO reporting timer may use acknowledgement alone:
+        deployed firmware accepts its download but aborts an upload/read.
+        """
+        if node not in self.nodes or (index, sub) not in {
+                (0x2004, 1), (0x2004, 2), (0x2004, 3),
+                (0x607D, 1), (0x607D, 2), (0x2009, 3), (0x1800, 5)}:
+            raise ValueError('Unsupported actuator parameter write')
+        if size not in (1, 2, 4):
+            raise ValueError('Unsupported SDO size')
+        if not verify_readback and (index, sub) != (0x1800, 5):
+            raise ValueError('Control parameter writes require independent readback')
+        key = struct.pack('<HB', index, sub)
+        raw = int(value).to_bytes(size, 'little', signed=signed)
+        self.inbox.clear()
+        self.send_frame(0x600+node, bytes([{1:0x2F, 2:0x2B, 4:0x23}[size]])+key+raw.ljust(4, b'\0'))
+        deadline = time.monotonic()+SDO_TIMEOUT
+        while time.monotonic() < deadline:
+            self.listen(0.003)
+            frames, self.inbox = self.inbox, []
+            for can_id, data, kind in frames:
+                if can_id != 0x580+node or not kind.islower() or len(data) < 4 or data[1:4] != key:
+                    continue
+                if data[0] == 0x80:
+                    code = f' (code 0x{int.from_bytes(data[4:8], "little"):08X})' if len(data) >= 8 else ''
+                    raise RuntimeError(f'Ankle node {node}: write aborted {index:04X}:{sub:02X}{code}')
+                if data[0] == 0x60:
+                    if not verify_readback:
+                        return value
+                    readback = self.read(node, index, sub, signed=signed)
+                    if readback != value:
+                        raise RuntimeError(f'Ankle node {node}: parameter readback mismatch')
+                    return readback
+        raise RuntimeError(f'Ankle node {node}: write acknowledgement timeout')
+
+    def read_position_pid(self):
+        return [[self.read(node, 0x2004, sub)/100000 for sub in (1, 2, 3)] for node in self.nodes]
+
+    def apply_position_pid(self, gains):
+        """Treat all three PID sets as one operation; roll back any partial write."""
+        if len(gains) != 3 or any(isinstance(x, bool) or not math.isfinite(x) or not 0 <= x <= 42949.67295 for x in gains):
+            raise ValueError('PID values must be finite and representable as unsigned 32-bit / 100000')
+        before = [[self.read(node, 0x2004, sub) for sub in (1,2,3)] for node in self.nodes]
+        attempted = []
+        try:
+            for i, node in enumerate(self.nodes):
+                for sub, value in enumerate(gains, 1):
+                    attempted.append((node, sub, before[i][sub-1]))
+                    self.write(node, 0x2004, sub, round(value*100000))
+            verified = self.read_position_pid()
+            if any(round(actual*100000) != round(expected*100000) for row in verified for actual,expected in zip(row,gains)):
+                raise RuntimeError('Final group PID readback differs from requested values')
+            return verified
+        except Exception as exc:
+            failures = []
+            for node, sub, value in reversed(attempted):
+                try:
+                    self.write(node, 0x2004, sub, value)
+                except Exception:
+                    failures.append(f'{node}:{sub}')
+            raise RuntimeError(f'Ankle group PID failed: {exc}; rollback '+
+                               ('unverified for '+', '.join(failures) if failures else 'verified')) from exc
+
+    def enable_monitoring(self):
+        # Documented PDO1 reporting period, 100 ms per node (not the control rate).
+        # This timer is write-only on deployed firmware. Require the matching
+        # download acknowledgement; actual PDO arrival establishes monitoring.
+        for node in self.nodes:
+            self.write(node, 0x1800, 5, 100, size=1, verify_readback=False)
 
     def validate_targets(self, targets):
         if len(targets) != 3 or len(self.limits) != 3:

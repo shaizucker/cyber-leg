@@ -236,6 +236,55 @@ class TransportTests(unittest.TestCase):
             driver.read(3, 0x2010, 5)
         self.assertEqual(len(port.sent), 1)
 
+    def test_node_three_loss_logs_other_heartbeats_and_refresh_continues(self):
+        class SilentNodeThree(LossySerialPort):
+            def write(self, raw):
+                result = super().write(raw)
+                frame = parse_frame(raw.decode().strip())
+                if frame and frame[0] == 0x603:
+                    self.pending.extend(b'b7010\r'+b'b7020\r')
+                return result
+        port = SilentNodeThree(drop=10)
+        logs = []
+        driver = SeenpinActuators(serial_factory=lambda *a, **k: port, log=logs.append)
+        driver.limits = [[0, 39]] * 3
+        driver.refresh = lambda: driver.move([20, 20, 20])
+        with patch('seenpin_driver.SDO_TIMEOUT', 0.015):
+            with self.assertRaisesRegex(RuntimeError, 'feedback timeout'):
+                driver.read(3, 0x2010, 5)
+        self.assertIn(0x701, driver.last_rx)
+        self.assertIn(0x702, driver.last_rx)
+        self.assertNotIn(0x703, driver.last_rx)
+        self.assertTrue(any('ANKLE LINK node 3: heartbeat never; SDO reply never' in x for x in logs))
+        self.assertTrue(any('ANKLE LINK node 1: heartbeat ' in x for x in logs))
+        self.assertTrue(all(node in driver.last_pdo for node in (1, 2, 3)))
+        self.assertEqual(sum(raw.startswith(b'b6038') for raw in port.sent), 3)
+        self.assertLessEqual(len(driver.recent_link), 24)
+
+    def test_adapter_reports_and_last_node_three_traffic_are_recorded(self):
+        port = SerialPort()
+        logs = []
+        driver = SeenpinActuators(serial_factory=lambda *a, **k: port, log=logs.append)
+        port.pending.extend(b'E02000001\rb7030\rb58364B1020050000\r')
+        driver.listen(0.01)
+        self.assertIn(0x703, driver.last_rx)
+        self.assertIn(0x583, driver.last_rx)
+        self.assertEqual(driver.adapter_events[-1][1], 'E02000001')
+        driver.log_link_diagnostics(3)
+        self.assertTrue(any('ANKLE adapter report: E02000001' in x for x in logs))
+        self.assertTrue(any('ANKLE LINK adapter reports: E02000001' in x for x in logs))
+        self.assertFalse(any('ANKLE LINK node 3: heartbeat never' in x for x in logs))
+
+    def test_position_command_gaps_are_measured_without_changing_payloads(self):
+        port = SerialPort()
+        driver = SeenpinActuators(serial_factory=lambda *a, **k: port)
+        with patch('seenpin_driver.time.monotonic', side_effect=[10, 10.02, 10.095]):
+            for _ in range(3):
+                driver.send_frame(0x203, position_payload(20))
+        self.assertAlmostEqual(driver.max_pdo_gap[3], 0.075)
+        self.assertEqual(len(set(port.sent)), 1)
+        self.assertEqual(parse_frame(port.sent[0].decode().strip())[1], position_payload(20))
+
     def test_adapter_errors_and_feedback_timeout(self):
         port = SerialPort()
         driver = SeenpinActuators(serial_factory=lambda *a, **k: port)

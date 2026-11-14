@@ -1,0 +1,43 @@
+{
+  "date": "2026-10-25",
+  "port": "COM7",
+  "old_id": 1,
+  "new_id": 3,
+  "motor_enable_disable_zero_or_position_commands_sent": false,
+  "parameter_writes": [
+    {
+      "can_id": "0x601",
+      "data": "2F 01 20 01 03 00 00 00"
+    }
+  ],
+  "verified": true,
+  "pre_write_heartbeats": [
+    1793
+  ],
+  "before": {
+    "reported_id": 1,
+    "fault": 0,
+    "position_mm": 24.07
+  },
+  "write_replies": [
+    {
+      "can_id": "0x581",
+      "data": "60 01 20 01"
+    }
+  ],
+  "write_acknowledged": true,
+  "node_id_parameter_readback": 3,
+  "parameter_change_verified": true,
+  "active_communication_id_after_write": 3,
+  "activation_pending_restart": false,
+  "fault_after_write": 0,
+  "position_after_write_mm": 24.07,
+  "power_cycle_persistence_verified": true,
+  "after_restart": {
+    "reported_id": 3,
+    "fault": 0,
+    "position_mm": 24.07,
+    "heartbeat_can_id": "0x703"
+  },
+  "initial_activation_error": "Ankle node 3: feedback timeout 2001:01 after 3 attempts; RX IDs: 0x701. Check node power, CAN connection and node ID"
+}
